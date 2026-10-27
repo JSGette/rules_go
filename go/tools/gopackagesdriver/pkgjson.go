@@ -29,8 +29,9 @@ import (
 // When set, the driver answers from those files and does not invoke Bazel.
 var pkgJSONList = os.Getenv("GOPACKAGESDRIVER_PKG_JSON_LIST")
 
-// runFromPkgJSON answers import-path queries from listed .pkg.json files.
-// Placeholders resolve against cwd (execroot inside an action).
+// runFromPkgJSON answers queries from listed .pkg.json files.
+// Placeholders, relative file= paths and local patterns resolve against cwd
+// (execroot inside an action).
 func runFromPkgJSON(listPath string, request *packages.DriverRequest, queries []string, out io.Writer) error {
 	jsonFiles, err := readLines(listPath)
 	if err != nil {
@@ -50,7 +51,7 @@ func runFromPkgJSON(listPath string, request *packages.DriverRequest, queries []
 	if err != nil {
 		return err
 	}
-	ids, err := driver.registry.MatchImportPaths(queries)
+	ids, err := driver.registry.MatchPatterns(queries, root)
 	if err != nil {
 		return err
 	}

@@ -556,7 +556,37 @@ func TestPkgJSONList(t *testing.T) {
 	}
 
 	runForTestExpectError(t, "found no packages matching import path", packages.DriverRequest{}, ".", "example.com/missing")
-	runForTestExpectError(t, "not supported", packages.DriverRequest{}, ".", "file=lib.go")
+
+	fileResp := runForTest(t, packages.DriverRequest{Mode: mode}, ".", "file="+root.GoFiles[0])
+	if len(fileResp.Roots) != 1 || fileResp.Roots[0] != resp.Roots[0] {
+		t.Fatalf("file query roots: got %v, want %v", fileResp.Roots, resp.Roots[:1])
+	}
+	runForTestExpectError(t, "found no packages matching file", packages.DriverRequest{}, ".", "file=does-not-exist.go")
+
+	local := runForTest(t, packages.DriverRequest{Mode: mode}, ".", "./offline/lib")
+	if len(local.Roots) != 1 || local.Roots[0] != resp.Roots[0] {
+		t.Fatalf("local roots: got %v, want %v", local.Roots, resp.Roots[:1])
+	}
+
+	stdResp := runForTest(t, packages.DriverRequest{Mode: mode}, ".", "std")
+	if len(stdResp.Roots) == 0 {
+		t.Fatal("std query returned no roots")
+	}
+	sawFmt := false
+	for _, id := range stdResp.Roots {
+		if strings.HasSuffix(id, "//stdlib:fmt") {
+			sawFmt = true
+			break
+		}
+	}
+	if !sawFmt {
+		t.Fatalf("std roots missing fmt: %v", stdResp.Roots)
+	}
+
+	builtinResp := runForTest(t, packages.DriverRequest{Mode: mode}, ".", "builtin")
+	if len(builtinResp.Roots) != 1 || !strings.HasSuffix(builtinResp.Roots[0], "//stdlib:builtin") {
+		t.Fatalf("builtin roots: %v", builtinResp.Roots)
+	}
 }
 
 func runForTest(
