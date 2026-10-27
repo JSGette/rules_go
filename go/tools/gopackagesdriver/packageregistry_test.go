@@ -15,64 +15,66 @@
 package main
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestMatchImportPaths(t *testing.T) {
+func TestMatchPatterns(t *testing.T) {
+	root := t.TempDir()
 	pr := NewPackageRegistry(
-		&FlatPackage{ID: "//lib:go_default_library", Name: "lib", PkgPath: "example.com/lib"},
+		&FlatPackage{ID: "//:root", Name: "root", PkgPath: "example.com/root"},
+		&FlatPackage{ID: "//lib:go_default_library", Name: "lib", PkgPath: "example.com/lib", GoFiles: []string{"lib/lib.go"}},
+		&FlatPackage{ID: "//lib:lib_test", Name: "lib_test", PkgPath: "example.com/lib_test", GoFiles: []string{"lib/lib.go", "lib/lib_test.go"}},
 		&FlatPackage{ID: "//lib/sub:go_default_library", Name: "sub", PkgPath: "example.com/lib/sub"},
 		&FlatPackage{ID: "//other:go_default_library", Name: "other", PkgPath: "example.com/other"},
+		&FlatPackage{ID: "//tool:tool", Name: "tool", PkgPath: "example.com/tool.go"},
+		&FlatPackage{ID: "@@rules_go+//lib:external", Name: "external", PkgPath: "example.com/external"},
+		&FlatPackage{ID: "//stdlib:builtin", Name: "builtin", PkgPath: "builtin", Standard: true},
 		&FlatPackage{ID: "//stdlib:fmt", Name: "fmt", PkgPath: "fmt", Standard: true},
+		&FlatPackage{ID: "@@//stdlib:net/http", Name: "http", PkgPath: "net/http", Standard: true},
 	)
 
-	t.Run("exact", func(t *testing.T) {
-		ids, err := pr.MatchImportPaths([]string{"example.com/lib"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(ids) != 1 || ids[0] != "//lib:go_default_library" {
-			t.Fatalf("got %v", ids)
-		}
-	})
-
-	t.Run("prefix", func(t *testing.T) {
-		ids, err := pr.MatchImportPaths([]string{"example.com/lib/..."})
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := "//lib/sub:go_default_library //lib:go_default_library"
-		if got := strings.Join(ids, " "); got != want {
-			t.Fatalf("got %q, want %q", got, want)
-		}
-	})
-
-	t.Run("unknown", func(t *testing.T) {
-		_, err := pr.MatchImportPaths([]string{"example.com/missing"})
-		if err == nil || !strings.Contains(err.Error(), "found no packages matching import path") {
-			t.Fatalf("got %v", err)
-		}
-	})
-
-	t.Run("stdlib_not_root", func(t *testing.T) {
-		_, err := pr.MatchImportPaths([]string{"fmt"})
-		if err == nil {
-			t.Fatal("expected error matching stdlib as root")
-		}
-	})
-
-	t.Run("file_query", func(t *testing.T) {
-		_, err := pr.MatchImportPaths([]string{"file=lib.go"})
-		if err == nil || !strings.Contains(err.Error(), "not supported") {
-			t.Fatalf("got %v", err)
-		}
-	})
-
-	t.Run("local_query", func(t *testing.T) {
-		_, err := pr.MatchImportPaths([]string{"./lib"})
-		if err == nil || !strings.Contains(err.Error(), "not supported") {
-			t.Fatalf("got %v", err)
-		}
-	})
+	const libPkgs = "//lib:go_default_library //lib:lib_test"
+	for _, tc := range []struct {
+		name    string
+		queries []string
+		want    string
+		wantErr string
+	}{
+		{name: "exact", queries: []string{"example.com/lib"}, want: "//lib:go_default_library"},
+		{name: "prefix", queries: []string{"example.com/lib/..."}, want: "//lib/sub:go_default_library //lib:go_default_library"},
+		{name: "unknown", queries: []string{"example.com/missing"}, wantErr: "found no packages matching import path"},
+		{name: "stdlib_import_path_not_root", queries: []string{"fmt"}, wantErr: "found no packages matching import path"},
+		{name: "import_path_ending_in_go", queries: []string{"example.com/tool.go"}, want: "//tool:tool"},
+		{name: "std", queries: []string{"std"}, want: "//stdlib:builtin //stdlib:fmt @@//stdlib:net/http"},
+		{name: "builtin", queries: []string{"builtin"}, want: "//stdlib:builtin"},
+		{name: "file", queries: []string{"file=lib/lib.go"}, want: libPkgs},
+		{name: "file_absolute", queries: []string{"file=" + filepath.Join(root, "lib", "lib.go")}, want: libPkgs},
+		{name: "local_file", queries: []string{"./lib/lib_test.go"}, want: "//lib:lib_test"},
+		{name: "file_miss", queries: []string{"file=missing.go"}, wantErr: "found no packages matching file"},
+		{name: "local_package", queries: []string{"./lib"}, want: libPkgs},
+		{name: "local_recursive", queries: []string{"./lib/..."}, want: "//lib/sub:go_default_library " + libPkgs},
+		{name: "local_root_skips_stdlib_and_external", queries: []string{"./..."}, want: "//:root //lib/sub:go_default_library " + libPkgs + " //other:go_default_library //tool:tool"},
+		{name: "dot", queries: []string{"."}, want: "//:root"},
+		{name: "local_absolute", queries: []string{filepath.Join(root, "lib")}, want: libPkgs},
+		{name: "local_outside_root", queries: []string{"../.."}, wantErr: "is outside"},
+		{name: "deduplicates", queries: []string{"./lib", "file=lib/lib.go"}, want: libPkgs},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ids, err := pr.MatchPatterns(tc.queries, root)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("got %v, want error containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(ids, " "); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

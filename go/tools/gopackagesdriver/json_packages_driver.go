@@ -49,25 +49,23 @@ func NewJSONPackagesDriver(jsonFiles []string, prf PathResolverFunc, overlays ma
 }
 
 func (b *JSONPackagesDriver) GetResponse(labels []string) *packages.DriverResponse {
-	rootPkgs, paks := b.registry.Match(labels)
-
-	return &packages.DriverResponse{
-		NotHandled: false,
-		Roots:      rootPkgs,
-		Packages:   paks,
-	}
+	roots, pkgs := b.registry.Match(labels)
+	return b.driverResponse(roots, pkgs)
 }
 
 // GetResponseFromIDs builds a driver response from package IDs already known
 // to be canonical (e.g. from .pkg.json), without Bazel version label rewriting.
 func (b *JSONPackagesDriver) GetResponseFromIDs(ids []string) *packages.DriverResponse {
-	rootPkgs, paks := b.registry.MatchCanonicalIDs(ids)
+	roots, pkgs := b.registry.MatchCanonicalIDs(ids)
+	return b.driverResponse(roots, pkgs)
+}
 
+func (b *JSONPackagesDriver) driverResponse(roots []string, pkgs []*packages.Package) *packages.DriverResponse {
 	return &packages.DriverResponse{
 		NotHandled: false,
 		Compiler:   buildContext.Compiler,
 		Arch:       buildContext.GOARCH,
-		Roots:      rootPkgs,
-		Packages:   paks,
+		Roots:      roots,
+		Packages:   pkgs,
 	}
 }
