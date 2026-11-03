@@ -337,9 +337,12 @@ need to configure them:
 - `GOPACKAGESDRIVER_PKG_JSON_LIST`: path to a file listing `.pkg.json` files
   produced by `go_pkg_info_aspect`, one per line. When set, the driver answers
   from those files and never invokes `bazel`, so `go/packages`-based tools can
-  run inside a Bazel action. Placeholder paths resolve against the working
-  directory (the execution root inside an action). Only import-path queries
-  (optionally ending in `/...`) are supported. Files are filtered for the
+  run inside a Bazel action. Placeholder paths, relative `file=` paths and
+  local patterns resolve against the working directory (the execution root
+  inside an action). Supported queries are import paths (optionally ending in
+  `/...`), `file=` paths, local patterns such as `./...`, `std` and `builtin`.
+  Only packages in the list are matched, and test packages in the list are
+  returned whether or not tests were requested. Files are filtered for the
   `GOOS`, `GOARCH` and `GOTAGS` of the driver's environment, so set them in the
   action when targeting another platform.
 
