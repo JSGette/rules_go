@@ -16,6 +16,8 @@ package main
 
 import (
 	"fmt"
+	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -118,54 +120,185 @@ func (pr *PackageRegistry) walk(acc map[string]*packages.Package, root string) {
 	}
 }
 
-// MatchImportPaths maps import-path queries to package IDs already loaded
-// in the registry. "/..." is a prefix match. Stdlib packages are never
-// roots. file= and local-directory queries error — they need bazel query.
-func (pr *PackageRegistry) MatchImportPaths(queries []string) ([]string, error) {
+// MatchPatterns maps driver queries onto package IDs already in the registry.
+// Relative file= paths and local patterns resolve against root. Stdlib
+// packages are roots only for "std" and "builtin": with rules_go as the main
+// module their IDs are "@@//stdlib:...", which "./..." would otherwise match.
+func (pr *PackageRegistry) MatchPatterns(queries []string, root string) ([]string, error) {
+	var files map[string][]string
 	ids := make([]string, 0, len(queries))
 	seen := map[string]struct{}{}
 
 	for _, query := range queries {
-		if strings.HasPrefix(query, "file=") || isLocalPattern(query) {
-			return nil, fmt.Errorf("query %q is not supported when answering from pkg.json files; use an import path", query)
-		}
-
 		var (
-			exact  string
-			prefix string
+			matched []string
+			err     error
 		)
-		if strings.HasSuffix(query, "/...") {
-			prefix = strings.TrimSuffix(query, "/...")
-		} else {
-			exact = query
+		switch {
+		case isFileQuery(query):
+			if files == nil {
+				files = pr.fileIndex(root)
+			}
+			matched, err = matchFile(files, query, root)
+		case query == "std" || query == "builtin":
+			matched, err = pr.matchStdlib(query)
+		case isLocalPattern(query):
+			matched, err = pr.matchLocal(query, root)
+		default:
+			matched, err = pr.matchImportPath(query)
 		}
-
-		matched := false
-		for _, pkg := range pr.packagesByID {
-			if _, isStdlib := pr.stdlib[pkg.PkgPath]; isStdlib {
-				continue
-			}
-			if exact != "" {
-				if pkg.PkgPath != exact {
-					continue
-				}
-			} else if pkg.PkgPath != prefix && !strings.HasPrefix(pkg.PkgPath, prefix+"/") {
-				continue
-			}
-			matched = true
-			if _, ok := seen[pkg.ID]; ok {
-				continue
-			}
-			seen[pkg.ID] = struct{}{}
-			ids = append(ids, pkg.ID)
+		if err != nil {
+			return nil, err
 		}
-		if !matched {
-			return nil, fmt.Errorf("found no packages matching import path %q", query)
+		for _, id := range matched {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
 		}
 	}
 
 	sort.Strings(ids)
 	return ids, nil
+}
+
+func (pr *PackageRegistry) matchImportPath(query string) ([]string, error) {
+	var (
+		exact  string
+		prefix string
+	)
+	if strings.HasSuffix(query, "/...") {
+		prefix = strings.TrimSuffix(query, "/...")
+	} else {
+		exact = query
+	}
+
+	var ids []string
+	for _, pkg := range pr.packagesByID {
+		if pr.isStdlib(pkg) {
+			continue
+		}
+		if exact != "" {
+			if pkg.PkgPath != exact {
+				continue
+			}
+		} else if pkg.PkgPath != prefix && !strings.HasPrefix(pkg.PkgPath, prefix+"/") {
+			continue
+		}
+		ids = append(ids, pkg.ID)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("found no packages matching import path %q", query)
+	}
+	return ids, nil
+}
+
+func (pr *PackageRegistry) matchStdlib(query string) ([]string, error) {
+	var ids []string
+	for _, pkg := range pr.stdlib {
+		if query == "std" || pkg.PkgPath == query {
+			ids = append(ids, pkg.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("found no packages matching %q", query)
+	}
+	return ids, nil
+}
+
+func (pr *PackageRegistry) matchLocal(query, root string) ([]string, error) {
+	dir, recursive, err := localPatternDir(query, root)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, pkg := range pr.packagesByID {
+		if pr.isStdlib(pkg) {
+			continue
+		}
+		pkgDir, ok := mainRepoPackageDir(pkg.ID)
+		if !ok {
+			continue
+		}
+		if pkgDir == dir || (recursive && (dir == "" || strings.HasPrefix(pkgDir, dir+"/"))) {
+			ids = append(ids, pkg.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("found no packages matching %q", query)
+	}
+	return ids, nil
+}
+
+func matchFile(files map[string][]string, query, root string) ([]string, error) {
+	ids := files[absPath(strings.TrimPrefix(query, "file="), root)]
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("found no packages matching file %q", query)
+	}
+	return ids, nil
+}
+
+func (pr *PackageRegistry) fileIndex(root string) map[string][]string {
+	idx := map[string][]string{}
+	for _, pkg := range pr.packagesByID {
+		for _, files := range [][]string{pkg.GoFiles, pkg.CompiledGoFiles, pkg.OtherFiles} {
+			for _, f := range files {
+				key := absPath(f, root)
+				idx[key] = append(idx[key], pkg.ID)
+			}
+		}
+	}
+	return idx
+}
+
+func (pr *PackageRegistry) isStdlib(pkg *packages.Package) bool {
+	_, ok := pr.stdlib[pkg.PkgPath]
+	return ok
+}
+
+func isFileQuery(query string) bool {
+	return strings.HasPrefix(query, "file=") || (isLocalPattern(query) && strings.HasSuffix(query, ".go"))
+}
+
+func absPath(p, root string) string {
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	return filepath.Join(root, p)
+}
+
+// localPatternDir returns the slash-separated directory of a local pattern
+// relative to root, with "" for root itself.
+func localPatternDir(pattern, root string) (string, bool, error) {
+	dir, recursive := strings.CutSuffix(pattern, "...")
+	if filepath.IsAbs(dir) {
+		rel, err := filepath.Rel(root, dir)
+		if err != nil {
+			return "", false, fmt.Errorf("query %q is outside %s", pattern, root)
+		}
+		dir = rel
+	}
+	dir = path.Clean(filepath.ToSlash(dir))
+	if dir == ".." || strings.HasPrefix(dir, "../") {
+		return "", false, fmt.Errorf("query %q is outside %s", pattern, root)
+	}
+	if dir == "." {
+		dir = ""
+	}
+	return dir, recursive, nil
+}
+
+// mainRepoPackageDir returns the package of a main-repo label such as
+// "@@//pkg:name". Labels in other repos, such as "@@rules_go+//pkg:name", are
+// never matched by local patterns.
+func mainRepoPackageDir(id string) (string, bool) {
+	repo, rest, ok := strings.Cut(id, "//")
+	if !ok || (repo != "" && repo != "@" && repo != "@@") {
+		return "", false
+	}
+	pkg, _, ok := strings.Cut(rest, ":")
+	return pkg, ok
 }
 
 func (pr *PackageRegistry) Match(labels []string) ([]string, []*packages.Package) {

@@ -20,6 +20,7 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/packages"
@@ -129,21 +130,81 @@ func TestRunFromPkgJSONTargetSizes(t *testing.T) {
 	}
 }
 
-func TestRunFromPkgJSONUnsupportedQuery(t *testing.T) {
+func TestRunFromPkgJSONFileAndLocalQuery(t *testing.T) {
 	dir := t.TempDir()
 	writePkgJSON(t, filepath.Join(dir, "lib.pkg.json"), FlatPackage{
-		ID:      "//lib:lib",
+		ID:      "//offline/lib:lib",
 		Name:    "lib",
-		PkgPath: "example.com/lib",
+		PkgPath: "example.com/offline/lib",
+		GoFiles: []string{"offline/lib/lib.go"},
+	})
+	writePkgJSON(t, filepath.Join(dir, "fmt.pkg.json"), FlatPackage{
+		ID:       "@@//stdlib:fmt",
+		Name:     "fmt",
+		PkgPath:  "fmt",
+		Standard: true,
 	})
 	listPath := filepath.Join(dir, "list")
-	if err := os.WriteFile(listPath, []byte(filepath.Join(dir, "lib.pkg.json")+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(listPath, []byte(
+		filepath.Join(dir, "lib.pkg.json")+"\n"+
+			filepath.Join(dir, "fmt.pkg.json")+"\n",
+	), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := runFromPkgJSON(listPath, &packages.DriverRequest{}, []string{"file=lib.go"}, &bytes.Buffer{})
-	if err == nil {
-		t.Fatal("expected error")
+
+	var out bytes.Buffer
+	if err := runFromPkgJSON(listPath, &packages.DriverRequest{}, []string{"file=offline/lib/lib.go"}, &out); err != nil {
+		t.Fatal(err)
 	}
+	resp := decodeDriverResponse(t, &out)
+	if len(resp.Roots) != 1 || resp.Roots[0] != "//offline/lib:lib" {
+		t.Fatalf("file roots: %v", resp.Roots)
+	}
+
+	out.Reset()
+	if err := runFromPkgJSON(listPath, &packages.DriverRequest{}, []string{"./offline/lib"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	resp = decodeDriverResponse(t, &out)
+	if len(resp.Roots) != 1 || resp.Roots[0] != "//offline/lib:lib" {
+		t.Fatalf("local roots: %v", resp.Roots)
+	}
+
+	out.Reset()
+	if err := runFromPkgJSON(listPath, &packages.DriverRequest{}, []string{"std"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	resp = decodeDriverResponse(t, &out)
+	if len(resp.Roots) != 1 || resp.Roots[0] != "@@//stdlib:fmt" {
+		t.Fatalf("std roots: %v", resp.Roots)
+	}
+
+	err := runFromPkgJSON(listPath, &packages.DriverRequest{}, []string{"file=missing.go"}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "found no packages matching file") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestGetResponseSetsCompilerArch(t *testing.T) {
+	driver := &JSONPackagesDriver{registry: NewPackageRegistry(
+		&FlatPackage{ID: "@//lib:lib", Name: "lib", PkgPath: "example.com/lib"},
+	)}
+	resp := driver.GetResponse([]string{"//lib:lib"})
+	if resp.Compiler != buildContext.Compiler || resp.Arch != buildContext.GOARCH {
+		t.Fatalf("Compiler=%q Arch=%q, want %q %q", resp.Compiler, resp.Arch, buildContext.Compiler, buildContext.GOARCH)
+	}
+	if len(resp.Roots) != 1 || resp.Roots[0] != "@//lib:lib" {
+		t.Fatalf("roots: %v", resp.Roots)
+	}
+}
+
+func decodeDriverResponse(t *testing.T, out *bytes.Buffer) packages.DriverResponse {
+	t.Helper()
+	var resp packages.DriverResponse
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	return resp
 }
 
 func writePkgJSON(t *testing.T, path string, pkg FlatPackage) {
