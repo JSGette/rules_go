@@ -34,7 +34,7 @@ func TestMain(m *testing.M) {
 	bazel_testing.TestMain(m, bazel_testing.Args{
 		Main: `
 -- BUILD.bazel --
-load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
 	name = "empty_lib",
@@ -46,6 +46,20 @@ go_library(
 	name = "covered",
 	srcs = ["covered.go"],
 	importpath = "covered",
+)
+
+go_library(
+	name = "covered_cgo",
+	srcs = ["nested/covered_cgo.go"],
+	cgo = True,
+	importpath = "covered_cgo",
+)
+
+go_test(
+	name = "covered_cgo_test",
+	srcs = ["covered_cgo_test.go"],
+	deps = [":covered_cgo"],
+	tags = ["manual"],
 )
 
 go_binary(
@@ -84,6 +98,44 @@ package covered
 
 func Covered() string {
 	return "covered"
+}
+-- nested/covered_cgo.go --
+package covered_cgo
+
+// static int covered(void) { return 42; }
+import "C"
+
+import "runtime"
+
+func Covered() int {
+	return int(C.covered())
+}
+
+func Position() (string, int) {
+	_, file, line, _ := runtime.Caller(0)
+	return file, line
+}
+-- covered_cgo_test.go --
+package covered_cgo_test
+
+import (
+	"path/filepath"
+	"testing"
+
+	"covered_cgo"
+)
+
+func TestCoveredCgo(t *testing.T) {
+	if got := covered_cgo.Covered(); got != 42 {
+		t.Errorf("Covered() = %d, want 42", got)
+	}
+	file, line := covered_cgo.Position()
+	if got, want := filepath.ToSlash(file), "nested/covered_cgo.go"; got != want {
+		t.Errorf("source file = %q, want %q", got, want)
+	}
+	if line != 13 {
+		t.Errorf("source line = %d, want 13", line)
+	}
 }
 -- add.h --
 #ifdef __cplusplus
@@ -372,32 +424,50 @@ func Test(t *testing.T) {
 
 	t.Run("Check coverage", func(t *testing.T) {
 		// Instrumented sources are written to a temporary directory, which must not leak into outputs.
-		for _, dir := range dirs[:2] {
-			cmd := bazel_testing.BazelCmd("build",
-				"--collect_code_coverage",
-				"--instrumentation_filter=^//:covered$",
-				"//:covered",
-			)
-			cmd.Dir = dir
-			if err := cmd.Run(); err != nil {
-				t.Fatalf("in %s, error running %s: %v", dir, strings.Join(cmd.Args, " "), err)
-			}
-		}
-		var dirHashes [2][]fileHash
-		for i := range dirHashes {
-			var err error
-			dirHashes[i], err = hashFiles(filepath.Join(dirs[i], "bazel-bin/"), func(root, path string) bool {
-				return path != root && (filepath.Dir(path) != root || !strings.HasPrefix(filepath.Base(path), "covered."))
+		for _, target := range []string{"covered", "covered_cgo"} {
+			t.Run(target, func(t *testing.T) {
+				for _, dir := range dirs[:2] {
+					cmd := bazel_testing.BazelCmd("build",
+						"--collect_code_coverage",
+						"--instrumentation_filter=^//:"+target+"$",
+						"//:"+target,
+					)
+					cmd.Dir = dir
+					if err := cmd.Run(); err != nil {
+						t.Fatalf("in %s, error running %s: %v", dir, strings.Join(cmd.Args, " "), err)
+					}
+				}
+				var dirHashes [2][]fileHash
+				for i := range dirHashes {
+					for _, ext := range []string{".a", ".x"} {
+						if _, err := os.Stat(filepath.Join(dirs[i], "bazel-bin", target+ext)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					var err error
+					dirHashes[i], err = hashFiles(filepath.Join(dirs[i], "bazel-bin/"), func(root, path string) bool {
+						return path != root && (filepath.Dir(path) != root || !strings.HasPrefix(filepath.Base(path), target+"."))
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := compareHashes(dirHashes[0], dirHashes[1]); err != nil {
+					t.Fatal(err)
+				}
+				if target == "covered_cgo" {
+					// Stable paths must still identify the original source and line.
+					cmd := bazel_testing.BazelCmd("coverage",
+						"--instrumentation_filter=^//:covered_cgo$",
+						"--test_output=errors",
+						"//:covered_cgo_test",
+					)
+					cmd.Dir = dirs[0]
+					if output, err := cmd.CombinedOutput(); err != nil {
+						t.Fatalf("error running %s: %v\n%s", strings.Join(cmd.Args, " "), err, output)
+					}
+				}
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-		if len(dirHashes[0]) == 0 {
-			t.Fatal("no covered outputs found")
-		}
-		if err := compareHashes(dirHashes[0], dirHashes[1]); err != nil {
-			t.Fatal(err)
 		}
 	})
 }

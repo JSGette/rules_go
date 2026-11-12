@@ -312,6 +312,10 @@ func generateCgoSources(goenv *env, baseWorkDir, subdir string, cgoSrcs, cSrcs, 
 	if err != nil {
 		return nil, err
 	}
+	// Coverage and gathered sources live in temporary directories. Trim their
+	// names before cgo resolves relative //line directives and emits C #line
+	// directives, with the most specific directory first.
+	trimPath = workDir + ";" + baseWorkDir + ";" + trimPath
 	args := goenv.goTool("cgo", "-srcdir", srcDir, "-objdir", workDir, "-trimpath", trimPath)
 	if ldflagsFile != nil {
 		// The "@" prefix tells cgo to read arguments from the file.

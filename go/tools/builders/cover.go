@@ -75,7 +75,11 @@ func instrumentForCoverage(
 	}
 
 	goargs := goenv.goTool("cover", "-pkgcfg", pkgcfg, "-var", coverVar, "-mode", coverMode, "-outfilelist", covoutputs)
-	goargs = append(goargs, infiles...)
+	// cover copies input names into //line directives. Keep these names relative
+	// to the execroot: cgo hashes the instrumented source before applying -trimpath.
+	for _, infile := range infiles {
+		goargs = append(goargs, relCoverPath[infile])
+	}
 	if err := goenv.runCommand(goargs); err != nil {
 		return nil, err
 	}
