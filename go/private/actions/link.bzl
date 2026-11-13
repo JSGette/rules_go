@@ -24,6 +24,7 @@ load(
 )
 load(
     "//go/private:mode.bzl",
+    "LINKMODE_C_ARCHIVE",
     "LINKMODE_C_SHARED",
     "LINKMODE_NORMAL",
     "LINKMODE_PLUGIN",
@@ -146,25 +147,31 @@ def emit_link(
         transitive = [d.transitive for d in archive.direct],
     )
 
-    all_archive_data = depset(test_archives, transitive = [archive.transitive])
-    buildinfo_link_inputs = depset(
-        direct = [
-            metadata
-            for archive_data in test_archives
-            for metadata in [getattr(archive_data, "_package_metadata", None)]
-            if metadata
-        ] + [archive_data._imports for archive_data in test_archives],
-        transitive = [getattr(archive, "_buildinfo_link_inputs", depset())],
-    )
-
     builder_args.add_all(arcs, before_each = "-arc", map_each = _format_archive)
-    builder_args.add_all(all_archive_data, before_each = "-package_metadata", map_each = _format_package_metadata)
-    builder_args.add_all(
-        all_archive_data,
-        before_each = "-imports",
-        map_each = lambda d: _format_imports(d, archive.data.file),
-        allow_closure = True,
-    )
+
+    # Keep this in sync with shouldEmitBuildInfo in builders/buildinfo.go.
+    # These build modes do not embed module metadata. Declaring it as a link
+    # input would relink them after metadata-only changes with identical output.
+    emit_buildinfo = go.mode.linkmode not in (LINKMODE_C_ARCHIVE, LINKMODE_C_SHARED, LINKMODE_PLUGIN)
+    buildinfo_link_inputs = depset()
+    if emit_buildinfo:
+        all_archive_data = depset(test_archives, transitive = [archive.transitive])
+        buildinfo_link_inputs = depset(
+            direct = [
+                metadata
+                for archive_data in test_archives
+                for metadata in [getattr(archive_data, "_package_metadata", None)]
+                if metadata
+            ] + [archive_data._imports for archive_data in test_archives],
+            transitive = [getattr(archive, "_buildinfo_link_inputs", depset())],
+        )
+        builder_args.add_all(all_archive_data, before_each = "-package_metadata", map_each = _format_package_metadata)
+        builder_args.add_all(
+            all_archive_data,
+            before_each = "-imports",
+            map_each = lambda d: _format_imports(d, archive.data.file),
+            allow_closure = True,
+        )
     builder_args.add("-package_list", go.sdk.package_list)
     if go.coverage_enabled:
         builder_args.add("-cover")
@@ -208,10 +215,11 @@ def emit_link(
 
     builder_args.add("-o", executable)
     builder_args.add("-main", archive.data.file)
-    builder_args.add("-main_package_path", buildinfo_main_package_path)
-    builder_args.add("-main_imports", archive.data._imports)
-    if buildinfo_module_metadata:
-        builder_args.add("-main_module_metadata", buildinfo_module_metadata)
+    if emit_buildinfo:
+        builder_args.add("-main_package_path", buildinfo_main_package_path)
+        builder_args.add("-main_imports", archive.data._imports)
+        if buildinfo_module_metadata:
+            builder_args.add("-main_module_metadata", buildinfo_module_metadata)
     builder_args.add("-p", archive.data.importmap)
     tool_args.add_all(gc_linkopts)
     tool_args.add_all(go.toolchain.flags.link)
@@ -225,7 +233,7 @@ def emit_link(
     tool_args.add_joined("-extldflags", extldflags, join_with = " ")
 
     inputs_direct = stamp_inputs + [go.sdk.package_list]
-    if buildinfo_module_metadata:
+    if emit_buildinfo and buildinfo_module_metadata:
         inputs_direct.append(buildinfo_module_metadata)
     if go.coverage_enabled and go.coverdata:
         inputs_direct.append(go.coverdata.data.file)

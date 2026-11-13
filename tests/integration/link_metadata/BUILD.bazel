@@ -1,0 +1,7 @@
+load("@io_bazel_rules_go//go/tools/bazel_testing:def.bzl", "go_bazel_test")
+
+go_bazel_test(
+    name = "link_metadata_test",
+    size = "large",
+    srcs = ["link_metadata_test.go"],
+)
