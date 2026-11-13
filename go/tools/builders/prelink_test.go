@@ -24,6 +24,29 @@ import (
 	"testing"
 )
 
+func TestPrelinkSDKVersions(t *testing.T) {
+	for _, tc := range []struct {
+		builder string
+		input   string
+		wantOK  bool
+	}{
+		{"go1.26.7", "go1.26.7", true},
+		{"go1.26.10", "go1.26.10", true},
+		{"go1.26.7", "go1.26.10", false},
+		{"go1.26.10", "go1.26.7", false},
+		{"go1.26.8", "go1.26.8", false},
+		{"go1.26.11", "go1.26.11", false},
+		{"go1.27.0", "go1.27.0", false},
+		{"devel go1.26.10", "devel go1.26.10", false},
+		{"go1.26.10", "", false},
+		{"go1.26.10", "go1.26.10-custom", false},
+	} {
+		if err := validatePrelinkSDKVersions(tc.builder, tc.input); (err == nil) != tc.wantOK {
+			t.Errorf("builder %q / linker or recipe %q: err = %v, wantOK = %v", tc.builder, tc.input, err, tc.wantOK)
+		}
+	}
+}
+
 func TestReachableNativeObjects(t *testing.T) {
 	dir := t.TempDir()
 	write := func(name, data string) string {

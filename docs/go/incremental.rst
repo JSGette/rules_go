@@ -31,7 +31,7 @@ Milestones and acceptance gates
 
 4. **Cache Go prelink independently — opt-in implementation in this branch.**
    ``--features=go_split_link`` separates ``GoPrelink`` from ``GoHostLink`` for
-   Go 1.26.7 Linux amd64 normal executables. The first produces ``go.o`` and
+   Go 1.26.7 or 1.26.10 Linux amd64 normal executables. The first produces ``go.o`` and
    a versioned host-link plan; the second consumes native sidecars, ``cdeps``,
    and that plan. The standalone prototype under ``experiments/go_prelink``
    remains as a small stock-Go demonstration. The Bazel implementation stores
@@ -125,3 +125,9 @@ import/export directives and external linking. The `Go 1.26.7 FIPS linker code
 shows why external-link completion includes executable finalization. The
 prototype preserves that step rather than treating the CC invocation as the
 whole operation.
+
+Go 1.26.10 is explicitly supported after comparing the official release sources:
+`fips140.go <https://github.com/golang/go/blob/go1.26.10/src/cmd/link/internal/ld/fips140.go>`_
+and ``main.go`` are unchanged from 1.26.7, and the only change in ``lib.go`` is a
+Darwin host-link workaround. The builder, linker, and cached plan still require
+an exact version match; this does not enable intermediate or future versions.

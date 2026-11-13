@@ -32,7 +32,6 @@ import (
 )
 
 const (
-	prelinkSDK            = "go1.26.7"
 	prelinkCaptureEnv     = "GO_BAZEL_PRELINK_CAPTURE"
 	prelinkHandoffExit    = 77
 	prelinkHandoffMessage = "GO_BAZEL_PRELINK_HANDOFF_COMPLETE"
@@ -66,19 +65,34 @@ type prelinkReceipt struct {
 	Args     []string `json:"args"`
 }
 
+// Keep this explicit list in sync with the action eligibility in link.bzl.
+// Go 1.26.10 has the same Linux external-link protocol and FIPS finalizer as
+// 1.26.7; its only hostlink change is a Darwin linker workaround.
+func supportedPrelinkSDK(version string) bool {
+	return version == "go1.26.7" || version == "go1.26.10"
+}
+
+func validatePrelinkSDKVersions(builderVersion, sdkVersion string) error {
+	if !supportedPrelinkSDK(builderVersion) || sdkVersion != builderVersion {
+		return fmt.Errorf("split linking requires matching Go 1.26.7 or 1.26.10 builder, linker, and recipe versions; builder is %q, input is %q", builderVersion, sdkVersion)
+	}
+	return nil
+}
+
 func checkPrelinkSDK(e *env) error {
-	if runtime.Version() != prelinkSDK || runtime.GOOS != "linux" || runtime.GOARCH != "amd64" || os.Getenv("GOOS") != "linux" || os.Getenv("GOARCH") != "amd64" {
-		return fmt.Errorf("split linking requires the Go 1.26.7 builder and a native Linux amd64 target")
+	if !supportedPrelinkSDK(runtime.Version()) || runtime.GOOS != "linux" || runtime.GOARCH != "amd64" || os.Getenv("GOOS") != "linux" || os.Getenv("GOARCH") != "amd64" {
+		return fmt.Errorf("split linking requires a Go 1.26.7 or 1.26.10 builder and a native Linux amd64 target")
 	}
 	versionArgs := e.goTool("link", "-V")
 	version, err := exec.Command(versionArgs[0], versionArgs[1:]...).Output()
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(string(version)) != "link version "+prelinkSDK {
-		return fmt.Errorf("split linking requires the Go 1.26.7 SDK")
+	linkerVersion, ok := strings.CutPrefix(strings.TrimSpace(string(version)), "link version ")
+	if !ok {
+		return fmt.Errorf("unexpected linker version response %q", version)
 	}
-	return nil
+	return validatePrelinkSDKVersions(runtime.Version(), linkerVersion)
 }
 
 // Reject user overrides of the handoff and unsupported executable formats.
@@ -171,7 +185,7 @@ func reachableNativeObjects(mainPackage, mainImports string, importsEntries, nat
 	return selected, used, nil
 }
 
-// Go 1.26.7 writes long external-link argv using one %q string per line.
+// The supported SDKs write long external-link argv using one %q string per line.
 // Only its own response file is expanded; arbitrary user response files are
 // outside this handoff's supported, declared-input contract.
 func expandPrelinkResponse(args []string, tree string) ([]string, error) {
@@ -428,7 +442,7 @@ func runPrelink(e *env, args []string, tree string, nativeObjects []string, cont
 		return err
 	}
 	root := abs(".")
-	plan := prelinkPlan{Version: 1, SDK: prelinkSDK, NativeInsertIndex: insert, ContentBuildID: contentBuildID}
+	plan := prelinkPlan{Version: 1, SDK: runtime.Version(), NativeInsertIndex: insert, ContentBuildID: contentBuildID}
 	plan.Compiler, err = prelinkEncode(receipt.Compiler, tree, root)
 	if err != nil {
 		return err
@@ -493,8 +507,11 @@ func hostlink(args []string) error {
 	if err := readCgoJSON(filepath.Join(*tree, prelinkPlanName), &plan); err != nil {
 		return err
 	}
-	if plan.Version != 1 || plan.SDK != prelinkSDK || plan.NativeInsertIndex < 0 || plan.NativeInsertIndex > len(plan.Args) {
+	if plan.Version != 1 || plan.NativeInsertIndex < 0 || plan.NativeInsertIndex > len(plan.Args) {
 		return fmt.Errorf("unsupported or invalid prelink recipe")
+	}
+	if err := validatePrelinkSDKVersions(runtime.Version(), plan.SDK); err != nil {
+		return err
 	}
 	root := abs(".")
 	compiler, err := prelinkDecode(plan.Compiler, *tree, root, *output)
