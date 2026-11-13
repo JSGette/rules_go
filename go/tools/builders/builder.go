@@ -55,6 +55,10 @@ func main() {
 		action = cgoproject
 	case "cgoprepare":
 		action = cgoprepare
+	case "cgogenerate":
+		action = cgogenerate
+	case "cgocompile":
+		action = cgocompile
 	case "nogo":
 		action = nogo
 	case "nogovalidation":

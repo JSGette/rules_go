@@ -60,6 +60,7 @@ def emit_compilepkg(
         headers = depset(),
         cgo = False,
         cgo_inputs = depset(),
+        cgo_compile_inputs = None,
         cgo_out_dir = None,
         cppopts = [],
         copts = [],
@@ -191,10 +192,10 @@ def emit_compilepkg(
             sources = sources,
             headers = headers,
             cgo_inputs = cgo_inputs,
+            cgo_compile_inputs = cgo_compile_inputs if cgo_compile_inputs != None else cgo_inputs,
             cgo_out_dir = cgo_out_dir,
             out_lib = out_lib,
             out_cgo_export_h = out_cgo_export_h,
-            importpath = importpath,
             importmap = importmap,
             testfilter = testfilter,
             cppopts = cppopts,
@@ -265,10 +266,10 @@ def _run_cgo_prepare(
         sources,
         headers,
         cgo_inputs,
+        cgo_compile_inputs,
         cgo_out_dir,
         out_lib,
         out_cgo_export_h,
-        importpath,
         importmap,
         testfilter,
         cppopts,
@@ -279,20 +280,24 @@ def _run_cgo_prepare(
         ldflags):
     """Produces cgo Go sources and native objects independently of Go bodies."""
     sdk = go.sdk
-    go_sources = [src for src in sources if src.extension == "go"]
-    native_sources = [src for src in sources if src.extension not in ("go", "syso")]
+    project_sources = [src for src in sources if src.extension.lower() != "syso"]
+    native_sources = [src for src in sources if src.extension.lower() in ("c", "cc", "cpp", "cxx", "m", "mm", "s")]
     projection = go.declare_directory(go, path = out_lib.basename + ".cgo_projection")
+    native_manifest = go.declare_file(go, path = out_lib.basename + ".cgo_native.json")
+    generated = go.declare_directory(go, path = out_lib.basename + ".cgo_generated")
+    generated_header = go.declare_file(go, path = out_lib.basename + ".cgo_include/_cgo_export.h")
     objects = go.declare_directory(go, path = out_lib.basename + ".cgo_objects")
     env, execution_requirements = path_mapping_action_settings(go, True)
 
     project_args = go.builder_args(go, "cgoproject")
-    project_args.add_all(go_sources, before_each = "-src")
+    project_args.add_all(project_sources, before_each = "-src")
     project_args.add("-out", projection.path)
+    project_args.add("-native_manifest", native_manifest)
     if testfilter:
         project_args.add("-testfilter", testfilter)
     go.actions.run(
-        inputs = depset(go_sources, transitive = [sdk.tools, sdk.headers, go.stdlib.libs]),
-        outputs = [projection],
+        inputs = depset(project_sources, transitive = [sdk.tools, sdk.headers, go.stdlib.libs]),
+        outputs = [projection, native_manifest],
         mnemonic = "GoCgoProject",
         executable = go.toolchain._builder,
         arguments = [project_args],
@@ -301,41 +306,88 @@ def _run_cgo_prepare(
         execution_requirements = execution_requirements,
     )
 
-    prepare_args = go.builder_args(go, "cgoprepare")
-    prepare_args.add("-projection", projection.path)
-    prepare_args.add_all(native_sources, before_each = "-src")
-    prepare_args.add("-importpath", importpath or go.label.name)
-    if importmap:
-        prepare_args.add("-p", importmap)
-    prepare_args.add("-cgo_go_srcs", cgo_out_dir.path)
-    prepare_args.add("-cgo_objects", objects.path)
-    outputs = [cgo_out_dir, objects]
-    if out_cgo_export_h:
-        prepare_args.add("-cgoexport", out_cgo_export_h)
-        outputs.append(out_cgo_export_h)
-    for flag, opts in [
-        ("-cppflags", cppopts),
-        ("-cflags", copts),
-        ("-cxxflags", cxxopts),
-        ("-objcflags", objcopts),
-        ("-objcxxflags", objcxxopts),
-    ]:
-        if opts:
-            prepare_args.add(flag, quote_opts(opts))
-    arguments = [prepare_args]
-    if ldflags:
-        arguments.append(ldflags)
     env = dict(env)
     env["CC"] = go.cgo_tools.c_compiler_path
+    compile_inputs = [sdk.tools, sdk.headers, go.stdlib.libs, headers, cgo_compile_inputs, go.cc_toolchain_files]
+
+    generate_args = go.builder_args(go, "cgogenerate")
+    generate_args.add("-projection", projection.path)
+    generate_args.add("-native_manifest", native_manifest)
+    generate_args.add("-out", generated.path)
+    generate_args.add("-cgoexport", generated_header)
+    if importmap:
+        generate_args.add("-p", importmap)
+    generate_outputs = [generated, generated_header]
+    if out_cgo_export_h:
+        generate_args.add("-cgo_install_header", out_cgo_export_h)
+        generate_outputs.append(out_cgo_export_h)
+    if cppopts:
+        generate_args.add("-cppflags", quote_opts(cppopts))
+    if copts:
+        generate_args.add("-cflags", quote_opts(copts))
+    generate_arguments = [generate_args]
+    if ldflags:
+        generate_arguments.append(ldflags)
+    go.actions.run(
+        inputs = depset([projection, native_manifest], transitive = compile_inputs),
+        outputs = generate_outputs,
+        mnemonic = "GoCgoGenerate",
+        executable = go.toolchain._builder,
+        arguments = generate_arguments,
+        env = env,
+        toolchain = GO_TOOLCHAIN_LABEL,
+        execution_requirements = execution_requirements,
+    )
+
+    prepare_args = go.builder_args(go, "cgoprepare")
+    prepare_args.add("-generated", generated.path)
+    prepare_args.add("-native_manifest", native_manifest)
+    prepare_args.add("-cgo_go_srcs", cgo_out_dir.path)
+    prepare_args.add("-cgo_objects", objects.path)
+    native_objects = []
+    for index, src in enumerate(native_sources):
+        obj = go.declare_file(go, path = out_lib.basename + ".cgo_native{}.o".format(index))
+        native_objects.append(obj)
+        prepare_args.add("-native_src", src)
+        prepare_args.add("-native_object", obj)
+        compile_args = go.builder_args(go, "cgocompile")
+        compile_args.add("-native_manifest", native_manifest)
+        compile_args.add("-src", src)
+        compile_args.add("-cgoexport", generated_header)
+        compile_args.add("-o", obj)
+        if cppopts:
+            compile_args.add("-cppflags", quote_opts(cppopts))
+        extension = src.extension
+        if extension == "C" or extension.lower() in ("cc", "cpp", "cxx"):
+            opts = cxxopts
+        elif extension.lower() == "m":
+            opts = objcopts
+        elif extension.lower() == "mm":
+            opts = objcxxopts
+        else:
+            opts = copts
+        if opts:
+            compile_args.add("-cflags", quote_opts(opts))
+        go.actions.run(
+            inputs = depset([src, native_manifest, generated_header], transitive = compile_inputs),
+            outputs = [obj],
+            mnemonic = "GoCgoCompile",
+            executable = go.toolchain._builder,
+            arguments = [compile_args],
+            env = env,
+            toolchain = GO_TOOLCHAIN_LABEL,
+            execution_requirements = execution_requirements,
+        )
+
     go.actions.run(
         inputs = depset(
-            native_sources + [projection],
-            transitive = [sdk.tools, sdk.headers, go.stdlib.libs, headers, cgo_inputs, go.cc_toolchain_files],
+            native_objects + [generated, native_manifest],
+            transitive = [sdk.tools, sdk.headers, go.stdlib.libs, cgo_inputs, go.cc_toolchain_files],
         ),
-        outputs = outputs,
+        outputs = [cgo_out_dir, objects],
         mnemonic = "GoCgoPrepare",
         executable = go.toolchain._builder,
-        arguments = arguments,
+        arguments = [prepare_args],
         env = env,
         toolchain = GO_TOOLCHAIN_LABEL,
         execution_requirements = execution_requirements,

@@ -123,11 +123,22 @@ func TestCgoPrepareEmpty(t *testing.T) {
 	if err := writeCgoProjection(nil, projection, root); err != nil {
 		t.Fatal(err)
 	}
+	nativeManifest := filepath.Join(root, "native.json")
+	if err := writeCgoNativePlan(archiveSrcs{}, nativeManifest, root); err != nil {
+		t.Fatal(err)
+	}
+	generated := filepath.Join(root, "generated")
+	header, installHeader := filepath.Join(root, "_cgo_export.h"), filepath.Join(root, "_cgo_install.h")
+	if err := cgogenerate([]string{
+		"-sdk", root, "-projection", projection, "-native_manifest", nativeManifest,
+		"-out", generated, "-cgoexport", header, "-cgo_install_header", installHeader,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	goDir, objectDir := filepath.Join(root, "go"), filepath.Join(root, "objects")
-	header := filepath.Join(root, "export.h")
 	if err := cgoprepare([]string{
-		"-sdk", root, "-projection", projection,
-		"-cgo_go_srcs", goDir, "-cgo_objects", objectDir, "-cgoexport", header,
+		"-sdk", root, "-generated", generated, "-native_manifest", nativeManifest,
+		"-cgo_go_srcs", goDir, "-cgo_objects", objectDir,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -138,9 +149,127 @@ func TestCgoPrepareEmpty(t *testing.T) {
 	if len(goSrcs)+len(objects) != 0 {
 		t.Fatalf("empty package generated Go sources %v or native objects %v", goSrcs, objects)
 	}
-	for _, path := range []string{goDir, objectDir, header} {
+	for _, path := range []string{goDir, objectDir, header, installHeader} {
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("declared output %s missing: %v", path, err)
+		}
+	}
+}
+
+func TestCgoNativePlanBodyAndTags(t *testing.T) {
+	root := t.TempDir()
+	bridge := writeCgoTestSource(t, root, "bridge.go", "package p\nimport \"C\"\n")
+	native := writeCgoTestSource(t, root, "native.c", "int answer(void) { return 1; }\n")
+	cxx := writeCgoTestSource(t, root, "other.cc", "int other() { return 2; }\n")
+	asm := writeCgoTestSource(t, root, "native.S", "// assembly\n")
+	header := writeCgoTestSource(t, root, "native.h", "int answer(void);\n")
+	ignored := writeCgoTestSource(t, root, "ignored.c", "//go:build ignore\n\nint ignored;\n")
+	// Start with a different input order to exercise language ordering.
+	sources := []string{asm, cxx, native, ignored, header, bridge}
+	first, firstFile := makeCgoTestNativePlan(t, root, sources)
+	want := cgoNativePlan{
+		Sources: []cgoNativeSource{{Path: "native.c", Kind: "c"}, {Path: "other.cc", Kind: "cxx"}, {Path: "native.S", Kind: "asm"}},
+		Headers: []string{"native.h"}, HaveCgo: true, HasImportC: true,
+	}
+	if !reflect.DeepEqual(first, want) {
+		t.Fatalf("native plan = %+v, want %+v", first, want)
+	}
+	writeCgoTestSource(t, root, "native.c", "int answer(void) { return 3; }\n")
+	_, secondFile := makeCgoTestNativePlan(t, root, sources)
+	firstBytes, err := os.ReadFile(firstFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBytes, err := os.ReadFile(secondFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(firstBytes) != string(secondBytes) {
+		t.Fatalf("native body edit changed classification output:\n%s\n%s", firstBytes, secondBytes)
+	}
+	writeCgoTestSource(t, root, "native.c", "//go:build ignore\n\nint answer(void) { return 3; }\n")
+	filtered, _ := makeCgoTestNativePlan(t, root, sources)
+	if len(filtered.Sources) != 2 || filtered.Sources[0].Kind != "cxx" {
+		t.Fatalf("native build-tag change did not update selection: %+v", filtered)
+	}
+	// Assembly alone remains the responsibility of the Go assembler.
+	asmOnly, _ := makeCgoTestNativePlan(t, root, []string{asm})
+	if asmOnly.HaveCgo || asmOnly.HasImportC || len(asmOnly.Sources) != 1 {
+		t.Fatalf("assembly-only package incorrectly uses native compilation: %+v", asmOnly)
+	}
+}
+
+func TestCgoCompileInactiveSource(t *testing.T) {
+	t.Setenv("CGO_ENABLED", "1")
+	t.Setenv("CC", "")
+	for _, tc := range []struct {
+		name string
+		plan cgoNativePlan
+	}{
+		{"filtered", cgoNativePlan{HaveCgo: true}},
+		{"go_assembly", cgoNativePlan{Sources: []cgoNativeSource{{Path: "missing.S", Kind: "asm"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			manifest := filepath.Join(root, "native.json")
+			if err := writeCgoJSON(manifest, tc.plan); err != nil {
+				t.Fatal(err)
+			}
+			object := filepath.Join(root, "native.o")
+			if err := cgocompile([]string{"-sdk", root, "-native_manifest", manifest,
+				"-src", "missing.S", "-cgoexport", filepath.Join(root, "missing.h"), "-o", object}); err != nil {
+				t.Fatal(err)
+			}
+			contents, err := os.ReadFile(object)
+			if err != nil || len(contents) != 0 {
+				t.Fatalf("inactive source did not produce an empty placeholder: %q, %v", contents, err)
+			}
+		})
+	}
+}
+
+func TestCgoPrepareNativeOrderWithoutSources(t *testing.T) {
+	root := t.TempDir()
+	generated := filepath.Join(root, "generated")
+	if err := os.MkdirAll(generated, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCgoManifest(generated, cgoGenerated{}); err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(root, "native.json")
+	plan := cgoNativePlan{
+		HaveCgo: true,
+		Sources: []cgoNativeSource{{Path: "missing=a.c", Kind: "c"}, {Path: "missing.cc", Kind: "cxx"}, {Path: "missing.S", Kind: "asm"}},
+	}
+	if err := writeCgoJSON(manifest, plan); err != nil {
+		t.Fatal(err)
+	}
+	goDir, objectDir := filepath.Join(root, "go"), filepath.Join(root, "objects")
+	args := []string{"-sdk", root, "-generated", generated, "-native_manifest", manifest,
+		"-cgo_go_srcs", goDir, "-cgo_objects", objectDir}
+	// The original sources do not exist. Finishing must read only object
+	// files, use the plan's order, and omit an excluded source's placeholder.
+	for _, input := range []struct{ source, contents string }{
+		{"missing.S", "assembly object"}, {"excluded.c", ""}, {"missing.cc", "C++ object"}, {"missing=a.c", "C object"},
+	} {
+		object := writeCgoTestSource(t, root, input.source+".o", input.contents)
+		args = append(args, "-native_src", input.source, "-native_object", object)
+	}
+	if err := cgoprepare(args); err != nil {
+		t.Fatal(err)
+	}
+	goSrcs, objects, err := readCgoPrepared(goDir, objectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(goSrcs) != 0 || len(objects) != 3 {
+		t.Fatalf("unexpected prepared outputs: %v, %v", goSrcs, objects)
+	}
+	for i, want := range []string{"C object", "C++ object", "assembly object"} {
+		got, err := os.ReadFile(objects[i])
+		if err != nil || string(got) != want {
+			t.Errorf("object %d = %q (%v), want %q", i, got, err, want)
 		}
 	}
 }
@@ -195,6 +324,27 @@ func makeCgoTestProjection(t *testing.T, root string, sources []string, testFilt
 		t.Fatal(err)
 	}
 	return out
+}
+
+func makeCgoTestNativePlan(t *testing.T, root string, sources []string) (cgoNativePlan, string) {
+	t.Helper()
+	oldContext := build.Default
+	build.Default.CgoEnabled = true
+	build.Default.BuildTags = nil
+	defer func() { build.Default = oldContext }()
+	srcs, err := filterAndSplitFiles(sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(t.TempDir(), "native.json")
+	if err := writeCgoNativePlan(srcs, manifest, root); err != nil {
+		t.Fatal(err)
+	}
+	var plan cgoNativePlan
+	if err := readCgoJSON(manifest, &plan); err != nil {
+		t.Fatal(err)
+	}
+	return plan, manifest
 }
 
 func writeCgoTestSource(t *testing.T, root, name, contents string) string {

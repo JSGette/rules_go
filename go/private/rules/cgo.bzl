@@ -57,6 +57,8 @@ def cgo_configure(go, srcs, cdeps, cppopts, copts, cxxopts, clinkopts):
 
     Returns: a struct containing:
         inputs: depset of files that must be available for the build.
+        compile_inputs: depset of compilation headers, excluding native libraries
+            and additional linker inputs.
         deps: depset of files for dynamic libraries.
         runfiles: runfiles object for the C/C++ dependencies.
         cppopts: complete list of preprocessor options
@@ -201,6 +203,7 @@ def cgo_configure(go, srcs, cdeps, cppopts, copts, cxxopts, clinkopts):
 
     return struct(
         inputs = inputs,
+        compile_inputs = depset(transitive = inputs_transitive),
         deps = deps,
         link_inputs = link_inputs,
         runfiles = runfiles,

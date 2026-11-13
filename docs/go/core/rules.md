@@ -115,14 +115,21 @@ Use `bazel build --features=go_split_cgo //path:target` to separate cgo and
 native compilation from Go compilation. A source projection action selects the
 Go files importing `C`. If an edit changes only ordinary Go code, the projection
 stays identical and Bazel reuses the generated cgo sources and native objects.
-The native action uses the configured C/C++ toolchain, headers, flags, and
-`cdeps`, with declared inputs and outputs suitable for remote caching.
+Native sources compile in individual actions using the configured C/C++
+toolchain, headers, flags, and `cdeps`. Editing one native source reuses cgo
+generation and the other native objects. Changing only a native dependency's
+implementation reuses compilation and reruns the cgo probe link. All stages
+use declared inputs and outputs suitable for remote caching.
 
 This is opt-in because the extra actions can cost more than they save for small
 packages or clean builds. Coverage-instrumented packages and packages with
-directory artifacts in `srcs` keep the combined action. An edit anywhere in a
-Go file importing `C` still invalidates native preparation, as do changes to
-native sources, headers, flags, and libraries. Final linking is unchanged.
+directory artifacts in `srcs` keep the combined action. Generated C wrappers
+still compile together with cgo generation. An edit in a Go file importing `C`
+reruns that action; original native objects can be reused when the exported
+header is unchanged. Header and compiler-option changes invalidate the actions
+that consume them. Files used as textual includes must be declared as headers
+(for example through `cc_library(hdrs = [...])`), including included `.c` files.
+Final linking still runs after code changes.
 Disable the experiment with `--features=-go_split_cgo`.
 
 The [cgo edit-loop test](/tests/integration/cgo_incrementality/README.rst)

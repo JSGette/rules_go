@@ -139,6 +139,7 @@ def emit_archive(go, source = None, _recompile_suffix = "", recompile_internal_d
             gc_goopts = source.gc_goopts,
             cgo = True,
             cgo_inputs = cgo.inputs,
+            cgo_compile_inputs = cgo.compile_inputs,
             cgo_out_dir = cgo_out_dir,
             cppopts = cgo.cppopts,
             copts = cgo.copts,

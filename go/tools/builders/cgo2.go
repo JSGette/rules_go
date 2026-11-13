@@ -66,13 +66,16 @@ func cgo2(goenv *env, goSrcs, cgoSrcs, cSrcs, cxxSrcs, objcSrcs, objcxxSrcs, sSr
 		return "", nil, nil, err
 	}
 	workDir = gen.workDir
+	cObjs, mainObj, err := compileGeneratedCgo(goenv, gen, cc, cppFlags, cFlags)
+	if err != nil {
+		return "", nil, nil, err
+	}
 
 	// Compile C, C++, Objective-C/C++, and assembly code.
 	defaultCFlags := defaultCFlags(workDir)
 	combinedCFlags := combineFlags(cppFlags, gen.hdrIncludes, cFlags, defaultCFlags)
 	asmCFlags := combineFlags(cppFlags, cFlags, defaultCFlags)
 	for _, lang := range []struct{ srcs, flags []string }{
-		{gen.genCSrcs, combinedCFlags},
 		{cSrcs, combinedCFlags},
 		{cxxSrcs, combineFlags(cppFlags, gen.hdrIncludes, cxxFlags, defaultCFlags)},
 		{objcSrcs, combineFlags(cppFlags, gen.hdrIncludes, objcFlags, defaultCFlags)},
@@ -88,54 +91,8 @@ func cgo2(goenv *env, goSrcs, cgoSrcs, cSrcs, cxxSrcs, objcSrcs, objcxxSrcs, sSr
 		}
 	}
 
-	mainObj := filepath.Join(workDir, "_cgo_main.o")
-	if err := cCompile(goenv, gen.cgoMainC, cc, combinedCFlags, mainObj); err != nil {
-		return "", nil, nil, err
-	}
-
-	// Link cgo binary and use the symbols to generate _cgo_import.go.
-	mainBin := filepath.Join(workDir, "_cgo_.o") // .o is a lie; it's an executable
-	args := append([]string{cc, "-o", mainBin, mainObj}, cObjs...)
-	args = append(args, gen.combinedLdFlags...)
-	var originalErrBuf bytes.Buffer
-	if err := goenv.runCommandToFile(os.Stdout, &originalErrBuf, args); err != nil {
-		// If linking the binary for cgo fails, this is usually because the
-		// object files reference external symbols that can't be resolved yet.
-		// Since the binary is only produced to have its symbols read by the cgo
-		// command, there is no harm in trying to build it allowing unresolved
-		// symbols - the real link that happens at the end will fail if they
-		// rightfully can't be resolved.
-		var allowUnresolvedSymbolsLdFlag string
-		switch os.Getenv("GOOS") {
-		case "windows":
-			// MinGW's linker doesn't seem to support --unresolved-symbols
-			// and MSVC isn't supported at all.
-			os.Stderr.Write(relativizePaths(originalErrBuf.Bytes()))
-			return "", nil, nil, err
-		case "darwin", "ios":
-			allowUnresolvedSymbolsLdFlag = "-Wl,-undefined,dynamic_lookup"
-		default:
-			allowUnresolvedSymbolsLdFlag = "-Wl,--unresolved-symbols=ignore-all"
-		}
-		// Print and return the original error if we can't link the binary with
-		// the additional linker flags as they may simply be incorrect for the
-		// particular compiler/linker pair and would obscure the true reason for
-		// the failure of the original command.
-		if err2 := goenv.runCommandToFile(
-			os.Stdout,
-			ioutil.Discard,
-			append(args, allowUnresolvedSymbolsLdFlag),
-		); err2 != nil {
-			os.Stderr.Write(relativizePaths(originalErrBuf.Bytes()))
-			return "", nil, nil, err
-		}
-		// Do not print the original error - rerunning the command with the
-		// additional linker flag fixed it.
-	}
-
 	cgoImportsGo := filepath.Join(workDir, "_cgo_imports.go")
-	args = goenv.goTool("cgo", "-dynpackage", packageName, "-dynimport", mainBin, "-dynout", cgoImportsGo)
-	if err := goenv.runCommand(args); err != nil {
+	if err := linkCgo(goenv, cc, packageName, mainObj, filepath.Join(workDir, "_cgo_.o"), cgoImportsGo, cObjs, gen.combinedLdFlags); err != nil {
 		return "", nil, nil, err
 	}
 	gen.genGoSrcs = append(gen.genGoSrcs, cgoImportsGo)
@@ -158,6 +115,69 @@ func cgo2(goenv *env, goSrcs, cgoSrcs, cSrcs, cxxSrcs, objcSrcs, objcxxSrcs, sSr
 	}
 	copy(allGoSrcs[len(goSrcs):], gen.genGoSrcs)
 	return workDir, allGoSrcs, cObjs, nil
+}
+
+// compileGeneratedCgo keeps generated wrappers together, while allowing
+// original native sources to be compiled in separate actions.
+func compileGeneratedCgo(goenv *env, gen *cgoGenResult, cc string, cppFlags, cFlags []string) (objects []string, mainObj string, err error) {
+	flags := combineFlags(cppFlags, gen.hdrIncludes, cFlags, defaultCFlags(gen.workDir))
+	for _, src := range gen.genCSrcs {
+		obj := filepath.Join(gen.workDir, fmt.Sprintf("_x%d.o", len(objects)))
+		if err := cCompile(goenv, src, cc, flags, obj); err != nil {
+			return nil, "", err
+		}
+		objects = append(objects, obj)
+	}
+	mainObj = filepath.Join(gen.workDir, "_cgo_main.o")
+	if err := cCompile(goenv, gen.cgoMainC, cc, flags, mainObj); err != nil {
+		return nil, "", err
+	}
+	return objects, mainObj, nil
+}
+
+// linkCgo links the probe binary and records its dynamic imports. The main
+// object participates only in this probe, never in the final Go archive.
+func linkCgo(goenv *env, cc, packageName, mainObj, mainBin, importsGo string, objects, ldFlags []string) error {
+	args := append([]string{cc, "-o", mainBin, mainObj}, objects...)
+	args = append(args, ldFlags...)
+	var originalErrBuf bytes.Buffer
+	if err := goenv.runCommandToFile(os.Stdout, &originalErrBuf, args); err != nil {
+		// If linking the binary for cgo fails, this is usually because the
+		// object files reference external symbols that can't be resolved yet.
+		// Since the binary is only produced to have its symbols read by the cgo
+		// command, there is no harm in trying to build it allowing unresolved
+		// symbols - the real link that happens at the end will fail if they
+		// rightfully can't be resolved.
+		var allowUnresolvedSymbolsLdFlag string
+		switch os.Getenv("GOOS") {
+		case "windows":
+			// MinGW's linker doesn't seem to support --unresolved-symbols
+			// and MSVC isn't supported at all.
+			os.Stderr.Write(relativizePaths(originalErrBuf.Bytes()))
+			return err
+		case "darwin", "ios":
+			allowUnresolvedSymbolsLdFlag = "-Wl,-undefined,dynamic_lookup"
+		default:
+			allowUnresolvedSymbolsLdFlag = "-Wl,--unresolved-symbols=ignore-all"
+		}
+		// Print and return the original error if we can't link the binary with
+		// the additional linker flags as they may simply be incorrect for the
+		// particular compiler/linker pair and would obscure the true reason for
+		// the failure of the original command.
+		if err2 := goenv.runCommandToFile(
+			os.Stdout,
+			ioutil.Discard,
+			append(args, allowUnresolvedSymbolsLdFlag),
+		); err2 != nil {
+			os.Stderr.Write(relativizePaths(originalErrBuf.Bytes()))
+			return err
+		}
+		// Do not print the original error - rerunning the command with the
+		// additional linker flag fixed it.
+	}
+
+	args = goenv.goTool("cgo", "-dynpackage", packageName, "-dynimport", mainBin, "-dynout", importsGo)
+	return goenv.runCommand(args)
 }
 
 func cgo2GeneratedGoSrcsForNogo(goenv *env, cgoSrcs, cSrcs, cxxSrcs, objcSrcs, objcxxSrcs, hSrcs []string, packagePath string, cc string, cppFlags, cFlags, ldFlags []string, cgoGoSrcsPath string, cgoImportsSrc string) error {
