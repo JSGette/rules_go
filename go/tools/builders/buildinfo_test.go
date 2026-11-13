@@ -142,6 +142,108 @@ func TestModulesFromPackageMetadataFiles(t *testing.T) {
 	}
 }
 
+func TestReachableModulesTracksInputs(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, contents string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	mainImports := write("main.imports", "reachable\nwithout_manifest\nnon_go\n")
+	reachableImports := write("reachable.imports", "leaf\n")
+	leafImports := write("leaf.imports", "reachable\n") // Import graph cycles must terminate.
+	sharedMetadata := write("shared.json", `{"purl":"pkg:golang/example.com/shared@v1.0.0"}`)
+	leafMetadata := write("leaf.json", `{"purl":"pkg:golang/example.com/leaf@v1.0.0"}`)
+	withoutManifest := write("without_manifest.json", `{"purl":"pkg:golang/example.com/without_manifest@v1.0.0"}`)
+	nonGoMetadata := write("non_go.json", `{"purl":"pkg:npm/example@1.0.0"}`)
+	unusedMetadata := write("unused.json", `{"purl":"pkg:golang/example.com/unused@v2.0.0"}`)
+	unusedImports := filepath.Join(dir, "unused.imports") // Not read until the package becomes reachable.
+	metadata := []string{
+		"reachable=" + sharedMetadata,
+		"unused_shared=" + sharedMetadata,
+		"leaf=" + leafMetadata,
+		"without_manifest=" + withoutManifest,
+		"non_go=" + nonGoMetadata,
+		"unused=" + unusedMetadata,
+	}
+	imports := []string{"reachable=" + reachableImports, "leaf=" + leafImports, "unused=" + unusedImports}
+	candidates := []string{mainImports, reachableImports, leafImports, unusedImports, sharedMetadata, leafMetadata, withoutManifest, nonGoMetadata, unusedMetadata}
+	modules, used, err := reachableModules(mainImports, metadata, imports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(modules) != 3 {
+		t.Fatalf("got modules %+v, want three reachable Go modules", modules)
+	}
+	unused, err := unusedBuildInfoInputs(candidates, used, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantUnused := []string{filepath.ToSlash(unusedImports), filepath.ToSlash(unusedMetadata)}
+	if !reflect.DeepEqual(unused, wantUnused) {
+		t.Fatalf("unused inputs = %v, want %v", unused, wantUnused)
+	}
+
+	// A changed root imports manifest must activate previously-unread metadata
+	// and imports, including the module version changed while it was unused.
+	write("main.imports", "reachable\nwithout_manifest\nnon_go\nunused\n")
+	write("unused.imports", "")
+	modules, used, err = reachableModules(mainImports, metadata, imports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, module := range modules {
+		found = found || module.path == "example.com/unused" && module.version == "v2.0.0"
+	}
+	if !found {
+		t.Fatalf("activated module missing from %+v", modules)
+	}
+	unused, err = unusedBuildInfoInputs(candidates, used, nil)
+	if err != nil || len(unused) != 0 {
+		t.Fatalf("activated inputs were pruned: %v (%v)", unused, err)
+	}
+}
+
+func TestReachableModulesMissingInputs(t *testing.T) {
+	dir := t.TempDir()
+	mainImports := filepath.Join(dir, "main.imports")
+	if _, _, err := reachableModules(mainImports, nil, nil); err == nil {
+		t.Fatal("missing root imports manifest did not fail")
+	}
+	if err := os.WriteFile(mainImports, []byte("reachable\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(dir, "missing")
+	if _, _, err := reachableModules(mainImports, nil, []string{"reachable=" + missing}); err == nil {
+		t.Fatal("missing reachable imports manifest did not fail")
+	}
+	if _, _, err := reachableModules(mainImports, []string{"reachable=" + missing}, nil); err == nil {
+		t.Fatal("missing reachable metadata did not fail")
+	}
+}
+
+func TestUnusedBuildInfoInputsRetainsSharedPaths(t *testing.T) {
+	dir := t.TempDir()
+	mainOverride := filepath.Join(dir, "main-override.json")
+	archive := filepath.Join(dir, "library.a")
+	unused := filepath.Join(dir, "unused.json")
+	// The main override is retained even when its package is unreachable.
+	// An archive must also be retained if a metadata provider aliases it.
+	candidates := []string{unused, mainOverride, archive, unused, " leading.json", "line\nbreak.json"}
+	archiveAlias := dir + string(filepath.Separator) + "." + string(filepath.Separator) + "library.a"
+	got, err := unusedBuildInfoInputs(candidates, []string{mainOverride}, []string{archiveAlias})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{filepath.ToSlash(unused)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unused inputs = %v, want %v", got, want)
+	}
+}
+
 func parseModInfoData(t *testing.T, data string) *debug.BuildInfo {
 	t.Helper()
 

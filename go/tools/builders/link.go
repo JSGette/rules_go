@@ -41,6 +41,8 @@ func link(args []string) error {
 	xdefs := multiFlag{}
 	packageMetadataFiles := multiFlag{}
 	importsFiles := multiFlag{}
+	buildInfoInputs := multiFlag{}
+	linkInputs := multiFlag{}
 	archives := archiveMultiFlag{}
 	flags := flag.NewFlagSet("link", flag.ExitOnError)
 	goenv := envFlags(flags)
@@ -55,6 +57,7 @@ func link(args []string) error {
 	// differ when the executable package is below the module root.
 	mainModuleMetadata := flags.String("main_module_metadata", "", "Path to the main module's package_metadata JSON file.")
 	mainImportsPath := flags.String("main_imports", "", "Path to the main archive's own imports manifest.")
+	unusedInputsPath := flags.String("unused_inputs_list", "", "Output list of build-info inputs not read by this link action.")
 	race := flags.Bool("race", false, "Whether race instrumentation is enabled.")
 	msan := flags.Bool("msan", false, "Whether memory sanitizer instrumentation is enabled.")
 	cover := flags.Bool("cover", false, "Whether coverage instrumentation is enabled.")
@@ -63,6 +66,8 @@ func link(args []string) error {
 	flags.Var(&archives, "arc", "Label, package path, and file name of a dependency, separated by '='")
 	flags.Var(&packageMetadataFiles, "package_metadata", "Package path and path of a package_metadata JSON file, separated by '=' (repeated).")
 	flags.Var(&importsFiles, "imports", "Package path and path of an imports manifest, separated by '=' (repeated).")
+	flags.Var(&buildInfoInputs, "buildinfo_input", "A candidate build-info input for unused input discovery (repeated).")
+	flags.Var(&linkInputs, "link_input", "A non-build-info link input that must not be pruned (repeated).")
 	packageList := flags.String("package_list", "", "The file containing the list of standard library packages")
 	buildmode := flags.String("buildmode", "", "Build mode used.")
 	flags.Var(&xdefs, "X", "A string variable to replace in the linked binary (repeated).")
@@ -113,11 +118,13 @@ func link(args []string) error {
 
 	// Build an importcfg file.
 	modinfo := ""
+	var usedBuildInfoInputs []string
 	if shouldEmitBuildInfo(*buildmode) {
-		modules, err := reachableModules(*mainImportsPath, packageMetadataFiles, importsFiles)
+		modules, usedInputs, err := reachableModules(*mainImportsPath, packageMetadataFiles, importsFiles)
 		if err != nil {
 			return err
 		}
+		usedBuildInfoInputs = usedInputs
 		mainModule := moduleInfo{}
 		if *mainModuleMetadata != "" {
 			mainModules, err := modulesFromPackageMetadataFiles([]string{*mainModuleMetadata})
@@ -127,6 +134,7 @@ func link(args []string) error {
 			if len(mainModules) > 0 {
 				mainModule = mainModules[0]
 			}
+			usedBuildInfoInputs = append(usedBuildInfoInputs, *mainModuleMetadata)
 		}
 		modinfo = modInfoData(
 			*mainPackagePath,
@@ -231,6 +239,20 @@ func link(args []string) error {
 	if *buildmode == "c-archive" {
 		if err := stripArMetadata(*outFile); err != nil {
 			return fmt.Errorf("error stripping archive metadata: %v", err)
+		}
+	}
+
+	if *unusedInputsPath != "" {
+		unused, err := unusedBuildInfoInputs(buildInfoInputs, usedBuildInfoInputs, linkInputs)
+		if err != nil {
+			return fmt.Errorf("finding unused build-info inputs: %v", err)
+		}
+		contents := ""
+		if len(unused) > 0 {
+			contents = strings.Join(unused, "\n") + "\n"
+		}
+		if err := os.WriteFile(*unusedInputsPath, []byte(contents), 0666); err != nil {
+			return fmt.Errorf("writing unused build-info inputs: %v", err)
 		}
 	}
 

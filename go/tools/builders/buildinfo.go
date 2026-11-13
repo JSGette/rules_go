@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -89,23 +91,27 @@ func validSemverIdentifiers(value string, rejectNumericLeadingZero bool) bool {
 	return true
 }
 
-func reachableModules(mainImportsPath string, packageMetadataFiles, importsFiles []string) ([]moduleInfo, error) {
+// reachableModules also returns the files it read. A package metadata file may
+// describe several packages, so input discovery must track paths, not packages.
+func reachableModules(mainImportsPath string, packageMetadataFiles, importsFiles []string) ([]moduleInfo, []string, error) {
 	metadataPathByPackage, err := parseKeyedPaths(packageMetadataFiles)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	importsPathByPackage, err := parseKeyedPaths(importsFiles)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
+	var usedInputs []string
 	reachable := make(map[string]bool)
 	var queue []string
 	if mainImportsPath != "" {
 		queue, err = readImportsManifest(mainImportsPath)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		usedInputs = append(usedInputs, mainImportsPath)
 	}
 	for len(queue) > 0 {
 		pkg := queue[len(queue)-1]
@@ -121,8 +127,9 @@ func reachableModules(mainImportsPath string, packageMetadataFiles, importsFiles
 		}
 		imports, err := readImportsManifest(path)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		usedInputs = append(usedInputs, path)
 		queue = append(queue, imports...)
 	}
 
@@ -133,7 +140,53 @@ func reachableModules(mainImportsPath string, packageMetadataFiles, importsFiles
 		}
 	}
 	sort.Strings(metadataPaths)
-	return modulesFromPackageMetadataFiles(metadataPaths)
+	modules, err := modulesFromPackageMetadataFiles(metadataPaths)
+	if err != nil {
+		return nil, nil, err
+	}
+	return modules, append(usedInputs, metadataPaths...), nil
+}
+
+// unusedBuildInfoInputs excludes both files read for build information and
+// files that are also inputs to another part of linking. For example, a custom
+// PackageMetadataInfo may point to an otherwise-unused package's archive.
+func unusedBuildInfoInputs(candidates, used, protected []string) ([]string, error) {
+	inputKey := func(path string) (string, error) {
+		path, err := filepath.Abs(path)
+		if runtime.GOOS == "windows" {
+			// Conservatively retain aliases differing only in case on Windows.
+			path = strings.ToLower(path)
+		}
+		return path, err
+	}
+	retained := make(map[string]bool, len(used)+len(protected))
+	for _, paths := range [][]string{used, protected} {
+		for _, path := range paths {
+			key, err := inputKey(path)
+			if err != nil {
+				return nil, err
+			}
+			retained[key] = true
+		}
+	}
+	var unused []string
+	for _, path := range candidates {
+		// Bazel reads this output one line at a time and trims whitespace.
+		// Retain paths that cannot be represented faithfully in that format.
+		if path != strings.TrimSpace(path) || strings.ContainsAny(path, "\r\n") {
+			continue
+		}
+		key, err := inputKey(path)
+		if err != nil {
+			return nil, err
+		}
+		if !retained[key] {
+			unused = append(unused, filepath.ToSlash(path))
+			retained[key] = true
+		}
+	}
+	sort.Strings(unused)
+	return unused, nil
 }
 
 func readImportsManifest(path string) ([]string, error) {

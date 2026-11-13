@@ -465,7 +465,7 @@ func runEditLoop(t *testing.T, variant string) {
 				if s.Mnemonic == "GoCgoPrepare" || s.Mnemonic == "GoCgoGenerate" || s.Mnemonic == "GoCgoCompile" || strings.HasSuffix(output.Path, ".a") || strings.HasSuffix(output.Path, ".x") {
 					artifacts[output.Path] = label
 				}
-				if label == "//:app" && s.Mnemonic == "GoLink" {
+				if label == "//:app" && s.Mnemonic == "GoLink" && !strings.HasSuffix(output.Path, ".unused_buildinfo_inputs") {
 					executable = output.Path
 					artifacts[output.Path] = label
 				}
