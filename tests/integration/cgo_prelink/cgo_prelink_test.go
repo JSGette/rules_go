@@ -193,6 +193,7 @@ type actionCount struct {
 type observation struct {
 	Step         string                  `json:"step"`
 	Actions      map[string]actionCount  `json:"actions"`
+	Compiles     map[string]actionCount  `json:"compiles"`
 	Metrics      map[string]spawnMetrics `json:"metrics"`
 	GoSHA256     string                  `json:"goSHA256"`
 	BinarySHA256 string                  `json:"binarySHA256"`
@@ -247,7 +248,10 @@ func (s *buildSession) build(t *testing.T, step string, want int) observation {
 		t.Fatal(err)
 	}
 	defer log.Close()
-	row := observation{Step: step, Actions: make(map[string]actionCount), Metrics: make(map[string]spawnMetrics)}
+	row := observation{
+		Step: step, Actions: make(map[string]actionCount),
+		Compiles: make(map[string]actionCount), Metrics: make(map[string]spawnMetrics),
+	}
 	var prelinkInputs []spawnFile
 	decoder := json.NewDecoder(log)
 	for {
@@ -258,6 +262,15 @@ func (s *buildSession) build(t *testing.T, step string, want int) observation {
 			t.Fatalf("reading execution log: %v", err)
 		}
 		label := strings.TrimPrefix(action.TargetLabel, "@@")
+		if strings.HasPrefix(label, "//:") && (action.Mnemonic == "GoCompilePkg" || action.Mnemonic == "GoCompilePkgExternal") {
+			count := row.Compiles[label]
+			if action.CacheHit {
+				count.Cached++
+			} else {
+				count.Executed++
+			}
+			row.Compiles[label] = count
+		}
 		if action.Mnemonic == "GoCgoCompile" || (label == "//:cdep" && (action.Mnemonic == "CppCompile" || action.Mnemonic == "CppArchive")) {
 			for _, output := range action.ActualOutputs {
 				s.nativeArtifacts[output.Path] = true
@@ -327,6 +340,7 @@ func TestPrelinkEditLoop(t *testing.T) {
 	}
 	session := newBuildSession(t, nil, nil)
 	previous := session.build(t, "cold", 103)
+	assertCompileCount(t, previous, "//:lib", 1)
 	assertStageCount(t, previous, "GoPrelink", 1)
 	assertStageCount(t, previous, "GoHostLink", 1)
 	assertNoop(t, previous, session.build(t, "noop", 103))
@@ -344,6 +358,9 @@ func TestPrelinkEditLoop(t *testing.T) {
 		wantPrelink := 0
 		if edit.goEdit {
 			wantPrelink = 1
+			assertCompileCount(t, current, "//:lib", 1)
+		} else {
+			assertCompilesSkipped(t, current)
 		}
 		assertStageCount(t, current, "GoPrelink", wantPrelink)
 		assertStageCount(t, current, "GoHostLink", 1)
@@ -395,6 +412,9 @@ func TestRelocatedPrelink(t *testing.T) {
 		t.Fatal("relocation test did not create independent execroots")
 	}
 	after := second.build(t, "relocated-native-edit", 104)
+	if got := after.Compiles["//:lib"]; got.Executed != 0 || got.Cached != 1 {
+		t.Errorf("relocated GoCompilePkg = %+v, want exactly one cache hit and no execution", got)
+	}
 	if got := after.Actions["GoPrelink"]; got.Executed != 0 || got.Cached != 1 {
 		t.Errorf("relocated GoPrelink = %+v, want exactly one cache hit and no execution", got)
 	}
@@ -460,8 +480,26 @@ func assertStageCount(t *testing.T, row observation, mnemonic string, want int) 
 	}
 }
 
+func assertCompileCount(t *testing.T, row observation, label string, want int) {
+	t.Helper()
+	count := row.Compiles[label]
+	if count.Executed+count.Cached != want {
+		t.Errorf("%s: %s GoCompilePkg executions/cache hits = %+v, want %d total", row.Step, label, count, want)
+	}
+}
+
+func assertCompilesSkipped(t *testing.T, row observation) {
+	t.Helper()
+	for label, count := range row.Compiles {
+		if count.Executed+count.Cached != 0 {
+			t.Errorf("%s: %s GoCompilePkg should be reused without execution or a disk/remote cache lookup, got %+v", row.Step, label, count)
+		}
+	}
+}
+
 func assertNoop(t *testing.T, before, after observation) {
 	t.Helper()
+	assertCompilesSkipped(t, after)
 	assertStageCount(t, after, "GoPrelink", 0)
 	assertStageCount(t, after, "GoHostLink", 0)
 	if before.GoSHA256 != after.GoSHA256 || before.BinarySHA256 != after.BinarySHA256 || before.BuildID != after.BuildID {

@@ -143,7 +143,18 @@ func (e *env) goCmd(cmd string, args ...string) []string {
 // runCommand executes a subprocess that inherits stdout, stderr, and the
 // environment from this process.
 func (e *env) runCommand(args []string) error {
+	return e.runCommandInDir(args, "")
+}
+
+// runCommandInDir keeps relative GOROOT resolution anchored to the action's
+// execution root when an assembler runs inside a projected source tree.
+// Callers changing directory must supply absolute tool and file arguments.
+func (e *env) runCommandInDir(args []string, dir string) error {
 	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = dir
+	if dir != "" && os.Getenv("GOROOT") != "" {
+		cmd.Env = append(os.Environ(), "GOROOT="+abs(os.Getenv("GOROOT")))
+	}
 	// Redirecting stdout to stderr. This mirrors behavior in the go command:
 	// https://go.googlesource.com/go/+/refs/tags/go1.15.2/src/cmd/go/internal/work/exec.go#1958
 	buf := &bytes.Buffer{}

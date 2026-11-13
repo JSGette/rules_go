@@ -53,7 +53,8 @@ go_library(
 
 go_library(
     name = "lib",
-    srcs = ["ordinary.go", "nested/bridge.go", "native.c", "secondary.cc", "native.h"],
+    srcs = ["ordinary.go", "nested/bridge.go", "embedded.go", "native.c", "secondary.cc", "native.h"],
+    embedsrcs = ["embedded/data.txt"],
     cdeps = [":cdep"],
     cgo = True,
     cppopts = ["-DNATIVE_OPTION=0"],
@@ -83,6 +84,20 @@ go_test(
     cgo = True,
 )
 
+go_library(
+    name = "native_asm",
+    srcs = ["native_asm/bridge.go", "native_asm/value_amd64.S"],
+    cgo = True,
+    importpath = "example.com/incremental/native_asm",
+)
+
+go_binary(
+    name = "native_asm_app",
+    srcs = ["native_asm/main/main.go"],
+    deps = [":native_asm"],
+    pure = "off",
+)
+
 # Match tests/core/go_library's .syso fixture: cc_library selects the native
 # toolchain, and the genrule only changes the archive's extension.
 cc_library(
@@ -104,6 +119,9 @@ go_library(
         "retained/retained.go",
         "retained/retained_amd64.s",
         "retained/retained_arm64.s",
+        "asm_headers/value.h",
+        "precedence.h",
+        "retained/precedence.h",
         ":retained_syso",
     ],
     cgo = True,
@@ -152,6 +170,18 @@ func CgoPosition() (string, int) { _, file, line, _ := runtime.Caller(0); return
 //go:noinline
 //line templates/origin.tpl:100
 func TemplatePosition() (string, int) { _, file, line, _ := runtime.Caller(0); return file, line }
+-- embedded.go --
+package lib
+
+import _ "embed"
+
+//go:embed embedded/data.txt
+var embedded string
+
+//go:noinline
+func Embedded() string { return embedded }
+-- embedded/data.txt --
+retained embedded data
 -- native.c --
 #include "native.h"
 #include "cdep/native.h"
@@ -193,6 +223,7 @@ import (
 )
 
 func main() {
+    if lib.Embedded() != "retained embedded data\n" { panic("ordinary Go embedded data was not retained") }
     file, line := lib.OrdinaryPosition()
     checkPosition(file, line, "ordinary.go", 12)
     file, line = lib.CgoPosition()
@@ -218,19 +249,64 @@ func TestOrdinaryGoIsRetained(t *testing.T) {
 }
 -- native_only/unused.c --
 int unused(void) { return 42; }
+-- native_asm/bridge.go --
+package native_asm
+
+// int native_asm_value(void);
+import "C"
+
+//go:noinline
+func Value() int { return int(C.native_asm_value()) }
+-- native_asm/value_amd64.S --
+.text
+.globl native_asm_value
+.type native_asm_value,@function
+native_asm_value:
+    mov $42, %eax
+    ret
+.section .note.GNU-stack,"",@progbits
+-- native_asm/main/main.go --
+package main
+
+import (
+    "fmt"
+    "example.com/incremental/native_asm"
+)
+
+func main() { fmt.Println(native_asm.Value()) }
 -- retained/native.c --
 int retained_native(void) { return 2; }
+-- asm_headers/value.h --
+#define ASSEMBLY_VALUE 40
+-- precedence.h --
+#define SELECTED_VALUE ASSEMBLY_VALUE
+-- retained/precedence.h --
+#define SELECTED_VALUE 4000
 -- retained/retained.go --
 package retained
 
+import "runtime"
+
 func assemblyValue() int32
+func assemblyPC() uintptr
 func nativeValue() int32
 func Value() int32 { return assemblyValue() + nativeValue() }
+func AssemblyPosition() (string, int) {
+    pc := assemblyPC()
+    return runtime.FuncForPC(pc).FileLine(pc)
+}
 -- retained/retained_amd64.s --
 #include "textflag.h"
+#include "../asm_headers/value.h"
+#include "precedence.h"
 
 TEXT ·assemblyValue(SB), NOSPLIT, $0-4
-    MOVL $40, ret+0(FP)
+    MOVL $SELECTED_VALUE, ret+0(FP)
+    RET
+
+TEXT ·assemblyPC(SB), NOSPLIT, $0-8
+    LEAQ ·assemblyValue(SB), AX
+    MOVQ AX, ret+0(FP)
     RET
 
 TEXT ·nativeValue(SB), NOSPLIT, $0-4
@@ -239,10 +315,17 @@ TEXT ·nativeValue(SB), NOSPLIT, $0-4
     RET
 -- retained/retained_arm64.s --
 #include "textflag.h"
+#include "../asm_headers/value.h"
+#include "precedence.h"
 
 TEXT ·assemblyValue(SB), NOSPLIT, $0-4
-    MOVW $40, R0
+    MOVW $SELECTED_VALUE, R0
     MOVW R0, ret+0(FP)
+    RET
+
+TEXT ·assemblyPC(SB), NOSPLIT, $0-8
+    MOVD $·assemblyValue(SB), R0
+    MOVD R0, ret+0(FP)
     RET
 
 TEXT ·nativeValue(SB), NOSPLIT, $0-4
@@ -253,6 +336,8 @@ TEXT ·nativeValue(SB), NOSPLIT, $0-4
 package retained_test
 
 import (
+    "path/filepath"
+    "runtime"
     "testing"
     "example.com/incremental/retained"
 )
@@ -260,6 +345,11 @@ import (
 func TestRetainedObjects(t *testing.T) {
     if got := retained.Value(); got != 42 {
         t.Fatalf("Go assembly plus .syso result = %d, want 42", got)
+    }
+    file, line := retained.AssemblyPosition()
+    wantFile := "retained/retained_" + runtime.GOARCH + ".s"
+    if filepath.ToSlash(file) != wantFile || line != 6 {
+        t.Fatalf("assembly source location = %s:%d, want %s:6", file, line, wantFile)
     }
 }
 `})
@@ -334,6 +424,123 @@ func TestNativeOnly(t *testing.T) {
 	}
 }
 
+func TestNativeAssemblyEdit(t *testing.T) {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		t.Skip("native assembly fixture uses Linux amd64 syntax")
+	}
+	if err := bazel_testing.RunBazel("clean"); err != nil {
+		t.Fatal(err)
+	}
+	execRootBytes, err := bazel_testing.BazelOutput("info", "execution_root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	execRoot := strings.TrimSpace(string(execRootBytes))
+	logDir := t.TempDir()
+	artifacts := make(map[string]bool)
+	var executable, goArchive, fullArchive string
+	build := func(step string, want int) observation {
+		t.Helper()
+		logPath := filepath.Join(logDir, step+".json")
+		if err := bazel_testing.RunBazel("build", "//:native_asm_app",
+			"--features=go_split_cgo", "--features=-go_split_link",
+			"--remote_download_outputs=all", "--execution_log_json_file="+logPath); err != nil {
+			t.Fatal(err)
+		}
+		log, err := os.Open(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spawns, err := readSpawns(log)
+		log.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		row := observation{Variant: "split-native-assembly", Step: step, Actions: make(map[string]actionCount), SHA256: make(map[string]string)}
+		for _, action := range spawns {
+			label := strings.TrimPrefix(action.TargetLabel, "@@")
+			if label != "//:native_asm" && label != "//:native_asm_app" {
+				continue
+			}
+			key := label + " " + action.Mnemonic
+			count := row.Actions[key]
+			if action.CacheHit {
+				count.Cached++
+			} else {
+				count.Executed++
+			}
+			row.Actions[key] = count
+			for _, output := range action.ActualOutputs {
+				if strings.HasSuffix(output.Path, ".a") || strings.HasSuffix(output.Path, ".x") || strings.HasSuffix(output.Path, ".o") {
+					artifacts[output.Path] = true
+				}
+				if label == "//:native_asm" && strings.HasSuffix(output.Path, ".go.a") {
+					goArchive = output.Path
+				}
+				if label == "//:native_asm" && strings.HasSuffix(output.Path, ".a") && !strings.HasSuffix(output.Path, ".go.a") {
+					fullArchive = output.Path
+				}
+				if action.Mnemonic == "GoLink" && !strings.HasSuffix(output.Path, ".unused_buildinfo_inputs") {
+					executable = output.Path
+					artifacts[output.Path] = true
+				}
+			}
+		}
+		if executable == "" || goArchive == "" || fullArchive == "" {
+			t.Fatal("native assembly build did not report executable and both package archives")
+		}
+		for path := range artifacts {
+			data, err := os.ReadFile(filepath.Join(execRoot, filepath.FromSlash(path)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest := sha256.Sum256(data)
+			row.SHA256[path] = hex.EncodeToString(digest[:])
+		}
+		encoded, err := json.Marshal(row)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("native-assembly-loop %s", encoded)
+		output, err := exec.Command(filepath.Join(execRoot, filepath.FromSlash(executable))).CombinedOutput()
+		if err != nil || strings.TrimSpace(string(output)) != fmt.Sprint(want) {
+			t.Fatalf("%s: native assembly app = %q, %v; want %d", step, output, err, want)
+		}
+		return row
+	}
+	before := build("cold", 42)
+	const source = "native_asm/value_amd64.S"
+	original, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.WriteFile(source, original, 0666); err != nil {
+			t.Errorf("restoring native assembly: %v", err)
+		}
+	})
+	if strings.Count(string(original), "mov $42") != 1 {
+		t.Fatal("native assembly edit must match exactly once")
+	}
+	if err := os.WriteFile(source, []byte(strings.Replace(string(original), "mov $42", "mov $43", 1)), 0666); err != nil {
+		t.Fatal(err)
+	}
+	after := build("native-assembly-body", 43)
+	assertGoCompilesSkipped(t, after)
+	for _, mnemonic := range []string{"GoCgoCompile", "GoPack"} {
+		if count := after.Actions["//:native_asm "+mnemonic]; count.Executed+count.Cached != 1 {
+			t.Errorf("native assembly edit: %s = %+v, want one execution or disk/remote-cache hit", mnemonic, count)
+		}
+	}
+	if before.SHA256[goArchive] != after.SHA256[goArchive] {
+		t.Error("native assembly body edit changed the Go-only archive")
+	}
+	if before.SHA256[fullArchive] == after.SHA256[fullArchive] || before.SHA256[executable] == after.SHA256[executable] {
+		t.Error("native assembly body edit did not change compatibility archive and executable")
+	}
+	assertNoop(t, after, build("noop", 43))
+}
+
 func TestGoAssemblyAndSysoRetained(t *testing.T) {
 	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
 		t.Skip("fixture has Go assembly implementations for amd64 and arm64")
@@ -377,8 +584,11 @@ func runEditLoop(t *testing.T, variant string) {
 	preparedArtifacts := make(map[string]bool)
 	generatedArtifacts := make(map[string]bool)
 	nativeObjects := make(map[string]string) // original source -> declared object
+	nativeArtifacts := make(map[string]bool)
 	var executable string
 	var goOnlyArchive string
+	var fullArchive string
+	var exportArchive string
 
 	build := func(step string, want int) observation {
 		t.Helper()
@@ -409,6 +619,7 @@ func runEditLoop(t *testing.T, variant string) {
 			Variant: variant, Step: step, ElapsedMillis: elapsed.Milliseconds(),
 			Actions: make(map[string]actionCount), SHA256: make(map[string]string),
 		}
+		var compileActions, packActions []spawn
 		for _, s := range spawns {
 			label := strings.TrimPrefix(s.TargetLabel, "@@")
 			if label != "//:lib" && label != "//:consumer" && label != "//:app" && label != "//:go_dep" && label != "//:cdep" {
@@ -422,6 +633,14 @@ func runEditLoop(t *testing.T, variant string) {
 				count.Executed++
 			}
 			row.Actions[key] = count
+			if label == "//:lib" {
+				switch s.Mnemonic {
+				case "GoCompilePkg":
+					compileActions = append(compileActions, s)
+				case "GoPack":
+					packActions = append(packActions, s)
+				}
+			}
 			if label == "//:lib" && s.Mnemonic == "GoCgoCompile" {
 				compile := nativeCompile{CacheHit: s.CacheHit}
 				for _, input := range s.Inputs {
@@ -453,8 +672,17 @@ func runEditLoop(t *testing.T, variant string) {
 				row.Links = append(row.Links, linkObservation{label, s.Runner, s.CacheHit, s.Metrics})
 			}
 			for _, output := range s.ActualOutputs {
+				if s.Mnemonic == "GoCgoCompile" || (label == "//:cdep" && (s.Mnemonic == "CppCompile" || s.Mnemonic == "CppArchive")) {
+					nativeArtifacts[output.Path] = true
+				}
 				if label == "//:lib" && strings.HasSuffix(output.Path, ".go.a") {
 					goOnlyArchive = output.Path
+				}
+				if label == "//:lib" && strings.HasSuffix(output.Path, ".a") && !strings.HasSuffix(output.Path, ".go.a") {
+					fullArchive = output.Path
+				}
+				if label == "//:lib" && strings.HasSuffix(output.Path, ".x") {
+					exportArchive = output.Path
 				}
 				if s.Mnemonic == "GoCgoPrepare" {
 					preparedArtifacts[output.Path] = true
@@ -469,6 +697,16 @@ func runEditLoop(t *testing.T, variant string) {
 					executable = output.Path
 					artifacts[output.Path] = label
 				}
+			}
+		}
+		if variant == "split" {
+			// Spawns may be logged in any order. Check the data dependencies
+			// after discovering every native output, not their execution order.
+			for _, action := range compileActions {
+				assertCompileBoundary(t, step, action, nativeArtifacts, goOnlyArchive, fullArchive, exportArchive)
+			}
+			for _, action := range packActions {
+				assertPackBoundary(t, step, action, goOnlyArchive, fullArchive)
 			}
 		}
 		for path := range artifacts {
@@ -504,6 +742,8 @@ func runEditLoop(t *testing.T, variant string) {
 		assertActionRefreshed(t, baseline, "GoCgoProject")
 		assertActionRefreshed(t, baseline, "GoCgoGenerate")
 		assertActionRefreshed(t, baseline, "GoCgoPrepare")
+		assertActionRefreshed(t, baseline, "GoCompilePkg")
+		assertActionRefreshed(t, baseline, "GoPack")
 		assertNativeCompiles(t, baseline, []string{"native.c", "secondary.cc"})
 		if len(preparedArtifacts) == 0 {
 			t.Fatal("baseline did not log prepared cgo outputs")
@@ -567,15 +807,32 @@ func runEditLoop(t *testing.T, variant string) {
 		}
 		current := build(edit.step, 101+i)
 		if variant == "split" {
-			// This is the content boundary a future Go prelink action consumes.
-			// The final executable still uses the conventional combined archive.
+			// Native body edits must stop before the Go compiler, while the
+			// conventional archive still picks up changed native members.
 			goArchiveChanged := previous.SHA256[goOnlyArchive] != current.SHA256[goOnlyArchive]
 			switch edit.step {
 			case "c-body", "cxx-body", "cdep-body":
+				assertGoCompilesSkipped(t, current)
 				if goArchiveChanged {
 					t.Errorf("%s: native body edit changed the Go-only archive", edit.step)
 				}
+				if previous.SHA256[exportArchive] != current.SHA256[exportArchive] {
+					t.Errorf("%s: native body edit changed the export archive", edit.step)
+				}
+				if edit.step == "cdep-body" {
+					assertActionSkipped(t, current, "GoPack")
+					if previous.SHA256[fullArchive] != current.SHA256[fullArchive] {
+						t.Errorf("%s: separately linked native dependency changed the compatibility archive", edit.step)
+					}
+				} else {
+					assertActionRefreshed(t, current, "GoPack")
+					if previous.SHA256[fullArchive] == current.SHA256[fullArchive] {
+						t.Errorf("%s: packed native body edit did not change the compatibility archive", edit.step)
+					}
+				}
 			case "ordinary-go-body", "cgo-go-body":
+				assertActionRefreshed(t, current, "GoCompilePkg")
+				assertActionRefreshed(t, current, "GoPack")
 				if !goArchiveChanged {
 					t.Errorf("%s: Go body edit did not change the Go-only archive", edit.step)
 				}
@@ -644,6 +901,54 @@ func runEditLoop(t *testing.T, variant string) {
 		previous = current
 	}
 	assertNoop(t, previous, build("final-noop", 100+len(edits)))
+}
+
+func assertCompileBoundary(t *testing.T, step string, action spawn, nativeArtifacts map[string]bool, goArchive, fullArchive, exportArchive string) {
+	t.Helper()
+	for _, input := range action.Inputs {
+		if input.Path == "native.c" || input.Path == "secondary.cc" || input.Path == "cdep/native.c" ||
+			nativeArtifacts[input.Path] || strings.Contains(input.Path, ".cgo_objects") || strings.Contains(input.Path, ".cgo_native") {
+			t.Errorf("%s: GoCompilePkg consumes native source or object %s", step, input.Path)
+		}
+	}
+	var hasGo, hasExport bool
+	for _, output := range action.ActualOutputs {
+		hasGo = hasGo || output.Path == goArchive
+		hasExport = hasExport || output.Path == exportArchive
+		if output.Path == fullArchive {
+			t.Errorf("%s: GoCompilePkg still produces the compatibility archive", step)
+		}
+	}
+	if !hasGo || !hasExport {
+		t.Errorf("%s: GoCompilePkg must produce the Go-only and export archives", step)
+	}
+}
+
+func assertPackBoundary(t *testing.T, step string, action spawn, goArchive, fullArchive string) {
+	t.Helper()
+	var hasGo, hasNative, hasFull bool
+	for _, input := range action.Inputs {
+		hasGo = hasGo || input.Path == goArchive
+		hasNative = hasNative || strings.Contains(input.Path, ".cgo_objects") || strings.Contains(input.Path, ".cgo_native")
+	}
+	for _, output := range action.ActualOutputs {
+		hasFull = hasFull || output.Path == fullArchive
+		if output.Path == goArchive || strings.HasSuffix(output.Path, ".x") {
+			t.Errorf("%s: GoPack produces a compiler output %s", step, output.Path)
+		}
+	}
+	if !hasGo || !hasNative || !hasFull {
+		t.Errorf("%s: GoPack must consume the Go-only archive and native objects and produce the compatibility archive", step)
+	}
+}
+
+func assertGoCompilesSkipped(t *testing.T, row observation) {
+	t.Helper()
+	for key, count := range row.Actions {
+		if (strings.HasSuffix(key, " GoCompilePkg") || strings.HasSuffix(key, " GoCompilePkgExternal")) && count.Executed+count.Cached != 0 {
+			t.Errorf("%s: %s should be reused without execution or a disk/remote cache lookup, got %+v", row.Step, key, count)
+		}
+	}
 }
 
 func assertNativeCompiles(t *testing.T, row observation, want []string) {

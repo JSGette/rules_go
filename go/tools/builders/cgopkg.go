@@ -68,6 +68,20 @@ type cgoPrepared struct {
 	ObjectFiles []string `json:"object_files"`
 }
 
+// The Go compiler's inputs must not contain native source or object bytes.
+// Sources contains Go assembly and its selected headers only when HaveCgo is
+// false. All files share one projected root so relative includes still work.
+type cgoCompileInputs struct {
+	HaveCgo  bool               `json:"have_cgo"`
+	Sources  []cgoProjectedFile `json:"sources"`
+	Root     string             `json:"root,omitempty"`
+	Execroot string             `json:"execroot,omitempty"`
+}
+
+type cgoPreparedGo struct {
+	GoFiles []string `json:"go_files"`
+}
+
 func cgoproject(args []string) error {
 	args, _, err := expandParamsFiles(args)
 	if err != nil {
@@ -75,12 +89,14 @@ func cgoproject(args []string) error {
 	}
 	fs := flag.NewFlagSet("GoCgoProject", flag.ContinueOnError)
 	goenv := envFlags(fs)
-	var sources multiFlag
-	var testFilter, outDir, nativeManifest string
+	var sources, headers multiFlag
+	var testFilter, outDir, nativeManifest, compileInputs string
 	fs.Var(&sources, "src", "Go or native source file to classify")
+	fs.Var(&headers, "header", "Additional header available to Go assembly")
 	fs.StringVar(&testFilter, "testfilter", "off", "Controls test package filtering")
 	fs.StringVar(&outDir, "out", "", "Directory for the selected cgo sources")
 	fs.StringVar(&nativeManifest, "native_manifest", "", "File for selected native source metadata")
+	fs.StringVar(&compileInputs, "compile_inputs", "", "Optional projection of Go assembly inputs and cgo classification")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -107,7 +123,180 @@ func cgoproject(args []string) error {
 	if err := writeCgoProjection(srcs.goSrcs, outDir, execroot); err != nil {
 		return err
 	}
+	if compileInputs != "" {
+		if err := writeCgoCompileInputs(srcs, sources, headers, compileInputs, execroot); err != nil {
+			return err
+		}
+	}
 	return writeCgoNativePlan(srcs, nativeManifest, execroot)
+}
+
+func archiveHasCgo(srcs archiveSrcs) bool {
+	for _, src := range srcs.goSrcs {
+		if src.isCgo {
+			return true
+		}
+	}
+	return len(srcs.cSrcs)+len(srcs.cxxSrcs)+len(srcs.objcSrcs)+len(srcs.objcxxSrcs) > 0
+}
+
+func writeCgoCompileInputs(srcs archiveSrcs, originalSources, headers []string, outDir, execroot string) error {
+	if err := os.MkdirAll(outDir, 0777); err != nil {
+		return err
+	}
+	inputs := cgoCompileInputs{HaveCgo: archiveHasCgo(srcs)}
+	if inputs.HaveCgo || len(srcs.sSrcs) == 0 {
+		return writeCgoManifest(outDir, inputs)
+	}
+	selected := append(append([]fileInfo{}, srcs.sSrcs...), srcs.hSrcs...)
+	var files []string
+	seen := make(map[string]bool)
+	for _, src := range selected {
+		files = append(files, src.filename)
+	}
+	// A source excluded from standalone assembly may still be #included by
+	// another source. Preserve its bytes without adding it to Sources or to
+	// the selected header directories passed to the assembler.
+	for _, name := range originalSources {
+		switch strings.ToLower(filepath.Ext(name)) {
+		case ".s", ".h", ".hh", ".hpp", ".hxx":
+			files = append(files, name)
+		}
+	}
+	files = append(files, headers...)
+	for i, name := range files {
+		if !filepath.IsAbs(name) {
+			name = filepath.Join(execroot, name)
+		}
+		files[i] = filepath.Clean(name)
+	}
+	// Start at the execroot, not the common source directory, so includes
+	// resolved from the assembler's working directory retain their meaning.
+	root := filepath.Clean(execroot)
+	for _, name := range files {
+		for {
+			rel, err := filepath.Rel(root, name)
+			if err != nil {
+				return fmt.Errorf("project Go assembly input %q: %w", name, err)
+			}
+			if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				break
+			}
+			parent := filepath.Dir(root)
+			if parent == root {
+				return fmt.Errorf("no common root for Go assembly input %q", name)
+			}
+			root = parent
+		}
+	}
+	rootRelative, err := filepath.Rel(execroot, root)
+	if err != nil {
+		return err
+	}
+	execrootRelative, err := filepath.Rel(root, execroot)
+	if err != nil {
+		return err
+	}
+	inputs.Root = filepath.ToSlash(rootRelative)
+	inputs.Execroot = filepath.ToSlash(filepath.Join("src", execrootRelative))
+	projectedExecroot := filepath.Join(outDir, filepath.FromSlash(inputs.Execroot))
+	if err := os.MkdirAll(projectedExecroot, 0777); err != nil {
+		return err
+	}
+	// The assembler runs here to preserve cwd-before-source-dir include lookup.
+	// If all inputs belong to sibling repositories this directory is otherwise
+	// empty; a marker keeps it present when a tree artifact is restored remotely.
+	if err := os.WriteFile(filepath.Join(projectedExecroot, ".rules_go_cwd"), nil, 0666); err != nil {
+		return err
+	}
+	for i, name := range files {
+		rel, err := filepath.Rel(root, name)
+		if err != nil {
+			return err
+		}
+		projected := filepath.Join("src", rel)
+		if !seen[name] {
+			out := filepath.Join(outDir, projected)
+			if err := os.MkdirAll(filepath.Dir(out), 0777); err != nil {
+				return err
+			}
+			if err := copyFile(name, out); err != nil {
+				return err
+			}
+			seen[name] = true
+		}
+		if i < len(selected) {
+			original, err := relativeCgoPath(execroot, name)
+			if err != nil {
+				return err
+			}
+			inputs.Sources = append(inputs.Sources, cgoProjectedFile{Path: filepath.ToSlash(projected), Original: original})
+		}
+	}
+	return writeCgoManifest(outDir, inputs)
+}
+
+// readCgoCompileInputs returns already selected sources; filtering them again
+// could incorrectly apply filename constraints to their projected directories.
+// The first rewrite maps the projected execution root to the original working
+// directory. Its prefix is also an assembler include directory.
+func readCgoCompileInputs(dir string) (haveCgo bool, srcs archiveSrcs, rewrites []string, err error) {
+	var inputs cgoCompileInputs
+	if err := readCgoManifest(dir, &inputs); err != nil {
+		return false, srcs, nil, err
+	}
+	if inputs.HaveCgo || len(inputs.Sources) == 0 {
+		if len(inputs.Sources) != 0 {
+			return false, srcs, nil, fmt.Errorf("cgo compile projection contains native assembly inputs")
+		}
+		return inputs.HaveCgo, srcs, nil, nil
+	}
+	if !validCgoProjectedPath(inputs.Execroot) || inputs.Root == "" {
+		return false, srcs, nil, fmt.Errorf("invalid Go assembly projection root")
+	}
+	root := filepath.FromSlash(inputs.Root)
+	if root != "." {
+		for _, part := range strings.Split(inputs.Root, "/") {
+			if part != ".." {
+				return false, srcs, nil, fmt.Errorf("invalid Go assembly original root %q", inputs.Root)
+			}
+		}
+	}
+	rewrites = append(rewrites, filepath.Join(dir, filepath.FromSlash(inputs.Execroot))+"=>")
+	if root != "." {
+		rewrites = append(rewrites, filepath.Join(dir, "src")+"=>"+root)
+	}
+	for _, src := range inputs.Sources {
+		if !validCgoProjectedPath(src.Path) {
+			return false, srcs, nil, fmt.Errorf("invalid projected Go assembly path %q", src.Path)
+		}
+		original := filepath.FromSlash(src.Original)
+		if src.Original == "" || filepath.IsAbs(original) || filepath.VolumeName(original) != "" || strings.HasPrefix(original, string(filepath.Separator)) {
+			return false, srcs, nil, fmt.Errorf("invalid original Go assembly path %q", src.Original)
+		}
+		info := fileInfo{
+			filename:         filepath.Join(dir, filepath.FromSlash(src.Path)),
+			originalFilename: original,
+			matched:          true,
+		}
+		switch strings.ToLower(filepath.Ext(src.Path)) {
+		case ".s":
+			info.ext = sExt
+			srcs.sSrcs = append(srcs.sSrcs, info)
+		case ".h", ".hh", ".hpp", ".hxx":
+			info.ext = hExt
+			srcs.hSrcs = append(srcs.hSrcs, info)
+		default:
+			return false, srcs, nil, fmt.Errorf("unexpected Go assembly input %q", src.Path)
+		}
+	}
+	return false, srcs, rewrites, nil
+}
+
+func validCgoProjectedPath(name string) bool {
+	path := filepath.FromSlash(name)
+	clean := filepath.Clean(path)
+	return name != "" && !strings.Contains(name, "\\") && !strings.HasPrefix(path, string(filepath.Separator)) && !filepath.IsAbs(path) && filepath.VolumeName(path) == "" && clean != "." && clean != ".." && !strings.HasPrefix(clean, ".."+string(filepath.Separator))
 }
 
 func writeCgoNativePlan(srcs archiveSrcs, outPath, execroot string) error {
@@ -386,7 +575,7 @@ func cgoprepare(args []string) error {
 	}
 	fs := flag.NewFlagSet("GoCgoPrepare", flag.ContinueOnError)
 	goenv := envFlags(fs)
-	var generatedDir, nativeManifest, goDir, objectDir string
+	var generatedDir, nativeManifest, goDir, objectDir, goManifest string
 	var nativeSources, nativeObjects multiFlag
 	fs.StringVar(&generatedDir, "generated", "", "Generated Go sources, native objects, and link metadata")
 	fs.StringVar(&nativeManifest, "native_manifest", "", "Selected native source metadata")
@@ -394,6 +583,7 @@ func cgoprepare(args []string) error {
 	fs.Var(&nativeObjects, "native_object", "Compiled object matching the corresponding -native_src")
 	fs.StringVar(&goDir, "cgo_go_srcs", "", "Directory for all generated Go sources")
 	fs.StringVar(&objectDir, "cgo_objects", "", "Directory for native objects and their manifest")
+	fs.StringVar(&goManifest, "go_manifest", "", "Optional Go-source-only manifest, outside the generated Go tree")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -484,6 +674,11 @@ func cgoprepare(args []string) error {
 		}
 		prepared.GoFiles = append(prepared.GoFiles, filepath.Base(imports))
 	}
+	if goManifest != "" {
+		if err := writeCgoJSON(goManifest, cgoPreparedGo{GoFiles: prepared.GoFiles}); err != nil {
+			return err
+		}
+	}
 	return writeCgoManifest(objectDir, prepared)
 }
 
@@ -527,6 +722,21 @@ func readCgoPrepared(goDir, objectDir string) (goSrcs, objects []string, err err
 		}
 	}
 	return goSrcs, objects, nil
+}
+
+func readCgoPreparedGo(goDir, manifestPath string) ([]string, error) {
+	var prepared cgoPreparedGo
+	if err := readCgoJSON(manifestPath, &prepared); err != nil {
+		return nil, err
+	}
+	var sources []string
+	for _, name := range prepared.GoFiles {
+		if !validCgoProjectedPath(name) || filepath.Base(name) != name || filepath.Ext(name) != ".go" {
+			return nil, fmt.Errorf("invalid prepared cgo Go source name %q", name)
+		}
+		sources = append(sources, filepath.Join(goDir, name))
+	}
+	return sources, nil
 }
 
 func writeCgoManifest(dir string, manifest interface{}) error {

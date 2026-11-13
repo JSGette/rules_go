@@ -136,9 +136,10 @@ func TestCgoPrepareEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	goDir, objectDir := filepath.Join(root, "go"), filepath.Join(root, "objects")
+	goManifest := filepath.Join(root, "go.json")
 	if err := cgoprepare([]string{
 		"-sdk", root, "-generated", generated, "-native_manifest", nativeManifest,
-		"-cgo_go_srcs", goDir, "-cgo_objects", objectDir,
+		"-cgo_go_srcs", goDir, "-cgo_objects", objectDir, "-go_manifest", goManifest,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -149,11 +150,238 @@ func TestCgoPrepareEmpty(t *testing.T) {
 	if len(goSrcs)+len(objects) != 0 {
 		t.Fatalf("empty package generated Go sources %v or native objects %v", goSrcs, objects)
 	}
-	for _, path := range []string{goDir, objectDir, header, installHeader} {
+	if generated, err := readCgoPreparedGo(goDir, goManifest); err != nil || len(generated) != 0 {
+		t.Fatalf("empty Go-only manifest = %v, %v", generated, err)
+	}
+	if files := cgoTestTree(t, goDir); len(files) != 0 {
+		t.Fatalf("Go tree includes non-Go metadata: %v", files)
+	}
+	for _, path := range []string{goDir, objectDir, goManifest, header, installHeader} {
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("declared output %s missing: %v", path, err)
 		}
 	}
+}
+
+func TestCgoCompileInputsNativeBodiesAndSelection(t *testing.T) {
+	root := t.TempDir()
+	native := writeCgoTestSource(t, root, "native.c", "int answer(void) { return 1; }\n")
+	asm := writeCgoTestSource(t, root, "native.S", "// assembly version one\n")
+	header := writeCgoTestSource(t, root, "native.h", "int answer(void);\n")
+	// Native-only packages also need HaveCgo, without an import-C Go source.
+	sources := []string{native, asm, header}
+	first := makeCgoTestCompileInputs(t, root, sources, nil)
+	writeCgoTestSource(t, root, "native.c", "int answer(void) { return 2; }\n")
+	writeCgoTestSource(t, root, "native.S", "// assembly version two\n")
+	writeCgoTestSource(t, root, "native.h", "int answer(void); int other(void);\n")
+	second := makeCgoTestCompileInputs(t, root, sources, []string{filepath.Join(root, "not-read.h")})
+	if !reflect.DeepEqual(cgoTestTree(t, first), cgoTestTree(t, second)) {
+		t.Fatal("native bodies or header bytes leaked into compiler input projection")
+	}
+	haveCgo, srcs, rewrites, err := readCgoCompileInputs(first)
+	if err != nil || !haveCgo || len(srcs.sSrcs)+len(srcs.hSrcs)+len(rewrites) != 0 {
+		t.Fatalf("native compile projection = %v, %+v, %v, %v", haveCgo, srcs, rewrites, err)
+	}
+	writeCgoTestSource(t, root, "native.c", "//go:build ignore\n\nint answer(void) { return 2; }\n")
+	third := makeCgoTestCompileInputs(t, root, sources, nil)
+	haveCgo, srcs, rewrites, err = readCgoCompileInputs(third)
+	if err != nil || haveCgo || len(srcs.sSrcs) != 1 || len(srcs.hSrcs) != 1 || len(rewrites) != 1 {
+		t.Fatalf("Go assembly compile projection = %v, %+v, %v, %v", haveCgo, srcs, rewrites, err)
+	}
+	for _, contents := range cgoTestTree(t, third) {
+		if strings.Contains(contents, "int answer(void) { return") {
+			t.Fatal("excluded native source was copied into Go assembly projection")
+		}
+	}
+}
+
+func TestCgoCompileInputsSourceLayout(t *testing.T) {
+	var trees []map[string]string
+	for i := 0; i < 2; i++ {
+		top := t.TempDir()
+		root := filepath.Join(top, "execroot")
+		asm := writeCgoTestSource(t, root, "pkg/asm/impl.s", "#include \"../../include/shared.h\"\n")
+		header := writeCgoTestSource(t, root, "include/shared.h", "#include \"nested.h\"\n")
+		transitive := writeCgoTestSource(t, root, "include/nested.h", "#define VALUE 7\n")
+		siblingAsm := writeCgoTestSource(t, top, "external/impl.s", "#include \"../execroot/include/shared.h\"\n")
+		out := makeCgoTestCompileInputs(t, root, []string{asm, siblingAsm, header}, []string{header, transitive})
+		trees = append(trees, cgoTestTree(t, out))
+		haveCgo, srcs, rewrites, err := readCgoCompileInputs(out)
+		if err != nil || haveCgo || len(srcs.sSrcs) != 2 || len(srcs.hSrcs) != 1 || len(rewrites) != 2 {
+			t.Fatalf("assembly layout = %v, %+v, %v, %v", haveCgo, srcs, rewrites, err)
+		}
+		wantRewrites := []string{filepath.Join(out, "src", "execroot") + "=>", filepath.Join(out, "src") + "=>.."}
+		if !reflect.DeepEqual(rewrites, wantRewrites) {
+			t.Fatalf("rewrites = %v, want %v", rewrites, wantRewrites)
+		}
+		for j, original := range []string{asm, siblingAsm} {
+			originalRelative, err := filepath.Rel(root, original)
+			if err != nil || srcs.sSrcs[j].originalFilename != originalRelative {
+				t.Fatalf("original assembly filename = %q, want %q (%v)", srcs.sSrcs[j].originalFilename, originalRelative, err)
+			}
+			want, err := filepath.Rel(filepath.Dir(original), header)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := filepath.Rel(filepath.Dir(srcs.sSrcs[j].filename), srcs.hSrcs[0].filename)
+			if err != nil || got != want {
+				t.Fatalf("relative include path = %q (%v), want %q", got, err, want)
+			}
+		}
+		if want := filepath.Join("include", "shared.h"); srcs.hSrcs[0].originalFilename != want {
+			t.Fatalf("original header filename = %q, want %q", srcs.hSrcs[0].originalFilename, want)
+		}
+		if got, err := os.ReadFile(filepath.Join(filepath.Dir(srcs.hSrcs[0].filename), "nested.h")); err != nil || string(got) != "#define VALUE 7\n" {
+			t.Fatalf("transitive relative include unavailable: %q, %v", got, err)
+		}
+		for _, original := range []string{asm, siblingAsm, header, transitive} {
+			if err := os.Remove(original); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !reflect.DeepEqual(trees[i], cgoTestTree(t, out)) {
+			t.Fatal("compiler input projection depends on original source bytes")
+		}
+	}
+	if !reflect.DeepEqual(trees[0], trees[1]) {
+		t.Fatalf("compiler input projection depends on execution root: %v, %v", trees[0], trees[1])
+	}
+}
+
+func TestReadCgoCompileInputsRejectsEscapingPaths(t *testing.T) {
+	for _, bad := range []string{"../outside.s", "src/../../outside.s", "/outside.s"} {
+		out := t.TempDir()
+		inputs := cgoCompileInputs{Root: ".", Execroot: "src", Sources: []cgoProjectedFile{{Path: bad}}}
+		if err := writeCgoManifest(out, inputs); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := readCgoCompileInputs(out); err == nil {
+			t.Errorf("accepted escaping projection path %q", bad)
+		}
+	}
+}
+
+func TestCgoCompileInputsRetainsExcludedIncludes(t *testing.T) {
+	root := t.TempDir()
+	asm := writeCgoTestSource(t, root, "pkg/impl.s", "#include \"defs.s\"\n#include \"../include/defs.h\"\n")
+	excludedAsm := writeCgoTestSource(t, root, "pkg/defs.s", "//go:build ignore\n\n#define VALUE 42\n")
+	excludedHeader := writeCgoTestSource(t, root, "include/defs.h", "//go:build ignore\n\n#define OTHER 7\n")
+	out := makeCgoTestCompileInputs(t, root, []string{asm, excludedAsm, excludedHeader}, nil)
+	haveCgo, srcs, _, err := readCgoCompileInputs(out)
+	if err != nil || haveCgo || len(srcs.sSrcs) != 1 || len(srcs.hSrcs) != 0 {
+		t.Fatalf("excluded include became an assembly source or header directory: %v, %+v, %v", haveCgo, srcs, err)
+	}
+	for _, include := range []struct{ path, want string }{
+		{"defs.s", "#define VALUE 42"},
+		{"../include/defs.h", "#define OTHER 7"},
+	} {
+		path := filepath.Join(filepath.Dir(srcs.sSrcs[0].filename), filepath.FromSlash(include.path))
+		contents, err := os.ReadFile(path)
+		if err != nil || !strings.Contains(string(contents), include.want) {
+			t.Fatalf("excluded source unavailable for #include %q: %q, %v", include.path, contents, err)
+		}
+	}
+	before := cgoTestTree(t, out)
+	writeCgoTestSource(t, root, "pkg/defs.s", "//go:build ignore\n\n#define VALUE 43\n")
+	changed := makeCgoTestCompileInputs(t, root, []string{asm, excludedAsm, excludedHeader}, nil)
+	if reflect.DeepEqual(before, cgoTestTree(t, changed)) {
+		t.Fatal("editing an included source did not invalidate Go assembly")
+	}
+}
+
+func TestCgoCompileInputsSiblingOnlyCwd(t *testing.T) {
+	top := t.TempDir()
+	root := filepath.Join(top, "execroot")
+	asm := writeCgoTestSource(t, top, "external/impl.s", "// sibling assembly\n")
+	out := makeCgoTestCompileInputs(t, root, []string{asm}, nil)
+	_, _, rewrites, err := readCgoCompileInputs(out)
+	if err != nil || len(rewrites) != 2 {
+		t.Fatalf("sibling-only projection rewrites = %v, %v", rewrites, err)
+	}
+	projectedCwd := strings.SplitN(rewrites[0], "=>", 2)[0]
+	info, err := os.Stat(projectedCwd)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("projected cwd is not a directory: %v, %v", info, err)
+	}
+	marker, err := os.ReadFile(filepath.Join(projectedCwd, ".rules_go_cwd"))
+	if err != nil || len(marker) != 0 {
+		t.Fatalf("projected cwd has no stable file for remote tree restoration: %q, %v", marker, err)
+	}
+}
+
+func TestCgoPreparedGoManifestIndependentOfNativeObjects(t *testing.T) {
+	root := t.TempDir()
+	generated := filepath.Join(root, "generated")
+	writeCgoTestSource(t, generated, "generated.go", "package p\n")
+	if err := writeCgoManifest(generated, cgoGenerated{GoFiles: []string{"generated.go"}}); err != nil {
+		t.Fatal(err)
+	}
+	nativeManifest := filepath.Join(root, "native.json")
+	if err := writeCgoJSON(nativeManifest, cgoNativePlan{HaveCgo: true, Sources: []cgoNativeSource{{Path: "missing.c", Kind: "c"}}}); err != nil {
+		t.Fatal(err)
+	}
+	var manifests []string
+	for _, contents := range []string{"first native object", "second native object"} {
+		out := t.TempDir()
+		object := writeCgoTestSource(t, out, "native.o", contents)
+		goDir, objectDir, goManifest := filepath.Join(out, "go"), filepath.Join(out, "objects"), filepath.Join(out, "go.json")
+		if err := cgoprepare([]string{"-sdk", root, "-generated", generated, "-native_manifest", nativeManifest,
+			"-native_src", "missing.c", "-native_object", object, "-cgo_go_srcs", goDir,
+			"-cgo_objects", objectDir, "-go_manifest", goManifest}); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(goManifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifests = append(manifests, string(data))
+		if strings.Contains(string(data), "object") || strings.Contains(string(data), "_x") {
+			t.Fatalf("Go manifest contains native metadata: %s", data)
+		}
+		if err := os.RemoveAll(objectDir); err != nil {
+			t.Fatal(err)
+		}
+		files, err := readCgoPreparedGo(goDir, goManifest)
+		if err != nil || !reflect.DeepEqual(files, []string{filepath.Join(goDir, "generated.go")}) {
+			t.Fatalf("Go sources require native inputs: %v, %v", files, err)
+		}
+		if got := cgoTestTree(t, goDir); len(got) != 1 || got["generated.go"] != "package p\n" {
+			t.Fatalf("Go source tree contains metadata: %v", got)
+		}
+	}
+	if manifests[0] != manifests[1] {
+		t.Fatal("native object edit changed Go-only manifest")
+	}
+}
+
+func TestReadCgoPreparedGoRejectsInvalidNames(t *testing.T) {
+	for _, bad := range []string{"../outside.go", "sub/inside.go", "native.o", ""} {
+		root := t.TempDir()
+		manifest := filepath.Join(root, "go.json")
+		if err := writeCgoJSON(manifest, cgoPreparedGo{GoFiles: []string{bad}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readCgoPreparedGo(root, manifest); err == nil {
+			t.Errorf("accepted invalid generated Go name %q", bad)
+		}
+	}
+}
+
+func makeCgoTestCompileInputs(t *testing.T, root string, sources, headers []string) string {
+	t.Helper()
+	oldContext := build.Default
+	build.Default.CgoEnabled = true
+	build.Default.BuildTags = nil
+	defer func() { build.Default = oldContext }()
+	srcs, err := filterAndSplitFiles(sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	if err := writeCgoCompileInputs(srcs, sources, headers, out, root); err != nil {
+		t.Fatal(err)
+	}
+	return out
 }
 
 func TestCgoNativePlanBodyAndTags(t *testing.T) {

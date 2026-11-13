@@ -121,9 +121,11 @@ generation and the other native objects. Changing only a native dependency's
 implementation reuses compilation and reruns the cgo probe link. All stages
 use declared inputs and outputs suitable for remote caching.
 
-Split packages also emit a `.go.a` archive without the cgo native objects,
-alongside the conventional `.a` archive. Go assembly and `.syso` members stay
-in both. Private archive data carries this output and the ordered native object
+`GoCompilePkg` emits a `.go.a` archive without cgo native objects; a separate
+`GoPack` action inserts those objects to produce the conventional `.a` archive.
+Native body edits that preserve generated Go inputs skip Go compilation.
+Go assembly and `.syso` members stay in both archives, in their original order.
+Private archive data carries this output and the ordered native object
 sidecar for the separate Go prelink and host-link experiment below. Without
 that experiment, linking continues to consume the conventional archive.
 
@@ -150,8 +152,8 @@ splitting plus separate `GoPrelink` and `GoHostLink` actions. Prelink consumes
 Go-only archives and produces a relocatable Go object and a host-link plan.
 Host linking consumes that plan, reachable packages' native objects, and the
 configured C/C++ toolchain's libraries. C/C++ and `cdeps` body edits that preserve
-Go archive bytes can reuse the entire prelink result. Go compilation may still
-run; separating archive packing from compilation is a subsequent optimization.
+Go archive bytes can reuse the entire prelink result. Eligible split packages
+also reuse Go compilation when their generated Go inputs remain unchanged.
 
 The initial implementation supports normal executables with the Go 1.26.7 or 1.26.10 SDK
 on Linux amd64, with a Linux amd64 execution platform. Pure, static, race,

@@ -27,7 +27,8 @@ Milestones and acceptance gates
    ordered native sidecar through private archive data. The edit-loop gate
    requires stable Go archive bytes after C/C++ and native dependency body
    edits, and different bytes after Go body edits. Default linking still uses
-   the conventional archive, and Go compilation still runs after native edits.
+   the conventional archive. Milestone 5 removes its packing dependency from
+   Go compilation.
 
 4. **Cache Go prelink independently — opt-in implementation in this branch.**
    ``--features=go_split_link`` separates ``GoPrelink`` from ``GoHostLink`` for
@@ -48,23 +49,39 @@ Milestones and acceptance gates
    Forwarded file-reading linker options are rejected until capability probing
    can model their additional dependencies correctly.
 
-5. **Remove residual Go compilation after native edits — next.** Produce the
-   Go-only archive in ``GoCompilePkg`` and assemble the compatibility archive
-   in a small ``GoPack`` action. The compiler's inputs must omit native object
-   bytes and native source bodies. Preserve execution-time source selection,
-   Go assembly, nogo, and coverage fallback. Dynamic-import changes may still
-   invalidate Go compilation; an external-only path can later avoid the cgo
-   probe's dynamic-import dependency. Measure the extra action/copy cost on
-   clean builds before enabling this by default.
+5. **Remove residual Go compilation after native edits — opt-in implementation.**
+   ``GoCompilePkg`` produces the Go-only archive, export data, and archive
+   boundary metadata. ``GoPack`` inserts the ordered native members before
+   retained Go assembly/``.syso`` members to produce the compatibility archive.
+   Native source and object bytes are absent from the compiler inputs.
+   ``GoCgoProject`` preserves execution-time selection and projects assembly
+   and headers only when they belong to the Go assembler; a separate Go-source
+   manifest avoids reading the native sidecar. Nogo and coverage fallback
+   retain their existing behavior.
+
+   Integration gates require native body edits to skip Go compilation and,
+   with split linking, Go prelink entirely. A fresh execution root must restore
+   the compilation from cache after a native edit. Dynamic-import changes may
+   still invalidate Go compilation; an external-only path can later avoid the
+   cgo probe's dynamic-import dependency. The edit-loop fixture records action
+   counts and clean-build elapsed time, not an isolated measurement of copy
+   overhead; timings are not used as correctness thresholds.
+   Representative performance and remote execution validation remain necessary
+   before enabling this by default.
 
 6. **Reuse compiler backend work — separate compiler experiment if needed.**
-   First cache code generation per function or dependency group after normal
-   package parsing and type checking. Key entries on typed IR, compiler and
-   target configuration, ABI/layout facts, optimization inputs, and relevant
-   imported summaries. Retain full dependency invalidation for changes to
-   inlining, escape results, generic instantiations, and type layout. Compare
-   clean and incremental compiler output and runtime behavior before attempting
-   incremental type checking. Any new compiler repository starts private.
+   Keep package-level Bazel actions and first cache code generation per function
+   or dependency group after normal parsing, type checking, inlining, escape
+   analysis, and walk, before ``ssagen.Compile``. Cache relocatable results with
+   their GC/stack/PC/debug metadata, not only machine-code bytes. Key entries on
+   lowered IR, compiler and target configuration, ABI/layout facts, optimization
+   and PGO inputs, source positions, and relevant imported summaries. Retain
+   full dependency invalidation for changes to inlining, escape results,
+   generic instantiations, and type layout. Compare cold and warm compiler
+   output and runtime behavior before attempting incremental type checking.
+   Worker state must be disposable; sharing backend entries remotely needs an
+   explicit cache design beyond ordinary Bazel action caching. Any new compiler
+   repository starts private.
 
 7. **Reuse work across test binaries — a parallel track.** Build an explicit,
    immutable dependency image identified by SDK/configuration and the exact

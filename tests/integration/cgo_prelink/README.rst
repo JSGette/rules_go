@@ -15,6 +15,9 @@ must preserve both artifacts and skip both link stages. Reported timing strings
 come directly from Bazel and are diagnostic only.
 Prelink inputs must exclude native sidecar trees, standalone C/C++ objects, and
 native dependency objects and archives.
+The same observations record fixture Go compilations by target. Native body
+edits must skip all of them without execution or a disk/remote-cache lookup;
+a Go body edit must refresh its package compilation.
 
 Every executable run enables ``GODEBUG=fips140=on``, checks a SHA256 result and
 FIPS integrity verification, calls back from C into Go, and checks C++ and
@@ -28,3 +31,5 @@ and a native-only edit forces host linking in the second execroot while
 requiring its prelink artifact to come from the cache. This verifies replay of
 the captured link plan without access to its old execroot, rather than merely
 retrieving a previously linked executable.
+The edited native package's Go compilation must also come from the cache,
+proving that the compiler action key excludes the changed native body.

@@ -26,16 +26,18 @@ import (
 
 type fileInfo struct {
 	filename string
-	ext      ext
-	header   []byte
-	fset     *token.FileSet
-	parsed   *ast.File
-	parseErr error
-	matched  bool
-	isCgo    bool
-	pkg      string
-	imports  []fileImport
-	embeds   []fileEmbed
+	// originalFilename preserves include-directory ordering for projected assembly.
+	originalFilename string
+	ext              ext
+	header           []byte
+	fset             *token.FileSet
+	parsed           *ast.File
+	parseErr         error
+	matched          bool
+	isCgo            bool
+	pkg              string
+	imports          []fileImport
+	embeds           []fileEmbed
 }
 
 type ext int

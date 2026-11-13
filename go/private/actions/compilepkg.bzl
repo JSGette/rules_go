@@ -123,17 +123,25 @@ def emit_compilepkg(
         out_go_lib = go.declare_file(go, path = stem + ".go.a")
 
     sdk = go.sdk
-    inputs_direct = (sources + embedsrcs + [sdk.package_list, go.toolchain._pack] +
+    # Runtime source selection is preserved by GoCgoProject. Only Go and syso
+    # files are unconditional compiler inputs; assembly and its headers arrive
+    # through a projection that is empty when they belong to the C compiler.
+    compile_sources = [src for src in sources if src.extension in ("go", "syso")] if split_cgo else sources
+    compile_lib = out_go_lib if split_cgo else out_lib
+    pack_metadata = go.declare_file(go, path = out_lib.basename + ".pack.json") if split_cgo else None
+    inputs_direct = (compile_sources + embedsrcs + [sdk.package_list, go.toolchain._pack] +
                      [archive.data.export_file for archive in archives])
-    inputs_transitive = [sdk.headers, sdk.tools, go.stdlib.libs, headers]
-    outputs = [out_lib, out_export, out_imports]
-    if out_go_lib != None:
-        outputs.append(out_go_lib)
+    inputs_transitive = [sdk.headers, sdk.tools, go.stdlib.libs]
+    if not split_cgo:
+        inputs_transitive.append(headers)
+    outputs = [compile_lib, out_export, out_imports]
+    if pack_metadata != None:
+        outputs.append(pack_metadata)
 
     shared_args = go.builder_args(go)
-    shared_args.add_all(sources, before_each = "-src")
 
     compile_args = go.tool_args(go)
+    compile_args.add_all(compile_sources, before_each = "-src")
     compile_args.add("-pack", go.toolchain._pack)
     compile_args.add_all(embedsrcs, before_each = "-embedsrc", expand_directories = False)
     compile_args.add_all(
@@ -169,7 +177,7 @@ def emit_compilepkg(
         shared_args.add("-p", importmap)
     shared_args.add("-package_list", sdk.package_list)
 
-    compile_args.add("-lo", out_lib)
+    compile_args.add("-lo", compile_lib)
     compile_args.add("-o", out_export)
     compile_args.add("-imports", out_imports)
     if out_cgo_export_h and not split_cgo:
@@ -202,7 +210,7 @@ def emit_compilepkg(
     cgo_objects = None
     if split_cgo:
         cgo_go_srcs = cgo_out_dir
-        cgo_objects = _run_cgo_prepare(
+        prepared = _run_cgo_prepare(
             go,
             sources = sources,
             headers = headers,
@@ -220,10 +228,12 @@ def emit_compilepkg(
             objcxxopts = objcxxopts,
             ldflags = ldflags,
         )
-        inputs_direct.extend([cgo_go_srcs, cgo_objects])
+        cgo_objects = prepared.objects
+        inputs_direct.extend([cgo_go_srcs, prepared.go_manifest, prepared.compile_inputs])
         compile_args.add("-cgo_prepared_go", cgo_go_srcs.path)
-        compile_args.add("-cgo_prepared_objects", cgo_objects.path)
-        compile_args.add("-go_only_archive", out_go_lib)
+        compile_args.add("-cgo_prepared_go_manifest", prepared.go_manifest)
+        compile_args.add("-cgo_compile_inputs", prepared.compile_inputs.path)
+        compile_args.add("-pack_metadata", pack_metadata)
     elif cgo:
         if cgo_out_dir:
             cgo_go_srcs = cgo_out_dir
@@ -261,6 +271,24 @@ def emit_compilepkg(
         toolchain = GO_TOOLCHAIN_LABEL,
         execution_requirements = execution_requirements,
     )
+
+    if split_cgo:
+        pack_args = go.builder_args(go, "pack")
+        pack_args.add("-pack", go.toolchain._pack)
+        pack_args.add("-go_archive", out_go_lib)
+        pack_args.add("-metadata", pack_metadata)
+        pack_args.add("-cgo_objects", cgo_objects.path)
+        pack_args.add("-o", out_lib)
+        go.actions.run(
+            inputs = depset([out_go_lib, pack_metadata, cgo_objects, go.toolchain._pack], transitive = [sdk.tools]),
+            outputs = [out_lib],
+            mnemonic = "GoPack",
+            executable = go.toolchain._builder,
+            arguments = [pack_args],
+            env = env,
+            toolchain = GO_TOOLCHAIN_LABEL,
+            execution_requirements = execution_requirements,
+        )
 
     if have_nogo:
         _run_nogo(
@@ -304,7 +332,9 @@ def _run_cgo_prepare(
     project_sources = [src for src in sources if src.extension.lower() != "syso"]
     native_sources = [src for src in sources if src.extension.lower() in ("c", "cc", "cpp", "cxx", "m", "mm", "s")]
     projection = go.declare_directory(go, path = out_lib.basename + ".cgo_projection")
+    compile_inputs = go.declare_directory(go, path = out_lib.basename + ".cgo_compile_inputs")
     native_manifest = go.declare_file(go, path = out_lib.basename + ".cgo_native.json")
+    go_manifest = go.declare_file(go, path = out_lib.basename + ".cgo_go.json")
     generated = go.declare_directory(go, path = out_lib.basename + ".cgo_generated")
     generated_header = go.declare_file(go, path = out_lib.basename + ".cgo_include/_cgo_export.h")
     objects = go.declare_directory(go, path = out_lib.basename + ".cgo_objects")
@@ -313,12 +343,15 @@ def _run_cgo_prepare(
     project_args = go.builder_args(go, "cgoproject")
     project_args.add_all(project_sources, before_each = "-src")
     project_args.add("-out", projection.path)
+    project_args.add("-compile_inputs", compile_inputs.path)
+    project_args.add_all(headers, before_each = "-header")
+    project_args.add_all(sdk.headers, before_each = "-header")
     project_args.add("-native_manifest", native_manifest)
     if testfilter:
         project_args.add("-testfilter", testfilter)
     go.actions.run(
-        inputs = depset(project_sources, transitive = [sdk.tools, sdk.headers, go.stdlib.libs]),
-        outputs = [projection, native_manifest],
+        inputs = depset(project_sources, transitive = [headers, sdk.tools, sdk.headers, go.stdlib.libs]),
+        outputs = [projection, native_manifest, compile_inputs],
         mnemonic = "GoCgoProject",
         executable = go.toolchain._builder,
         arguments = [project_args],
@@ -329,7 +362,7 @@ def _run_cgo_prepare(
 
     env = dict(env)
     env["CC"] = go.cgo_tools.c_compiler_path
-    compile_inputs = [sdk.tools, sdk.headers, go.stdlib.libs, headers, cgo_compile_inputs, go.cc_toolchain_files]
+    native_compile_inputs = [sdk.tools, sdk.headers, go.stdlib.libs, headers, cgo_compile_inputs, go.cc_toolchain_files]
 
     generate_args = go.builder_args(go, "cgogenerate")
     generate_args.add("-projection", projection.path)
@@ -350,7 +383,7 @@ def _run_cgo_prepare(
     if ldflags:
         generate_arguments.append(ldflags)
     go.actions.run(
-        inputs = depset([projection, native_manifest], transitive = compile_inputs),
+        inputs = depset([projection, native_manifest], transitive = native_compile_inputs),
         outputs = generate_outputs,
         mnemonic = "GoCgoGenerate",
         executable = go.toolchain._builder,
@@ -364,6 +397,7 @@ def _run_cgo_prepare(
     prepare_args.add("-generated", generated.path)
     prepare_args.add("-native_manifest", native_manifest)
     prepare_args.add("-cgo_go_srcs", cgo_out_dir.path)
+    prepare_args.add("-go_manifest", go_manifest)
     prepare_args.add("-cgo_objects", objects.path)
     native_objects = []
     for index, src in enumerate(native_sources):
@@ -390,7 +424,7 @@ def _run_cgo_prepare(
         if opts:
             compile_args.add("-cflags", quote_opts(opts))
         go.actions.run(
-            inputs = depset([src, native_manifest, generated_header], transitive = compile_inputs),
+            inputs = depset([src, native_manifest, generated_header], transitive = native_compile_inputs),
             outputs = [obj],
             mnemonic = "GoCgoCompile",
             executable = go.toolchain._builder,
@@ -405,7 +439,7 @@ def _run_cgo_prepare(
             native_objects + [generated, native_manifest],
             transitive = [sdk.tools, sdk.headers, go.stdlib.libs, cgo_inputs, go.cc_toolchain_files],
         ),
-        outputs = [cgo_out_dir, objects],
+        outputs = [cgo_out_dir, objects, go_manifest],
         mnemonic = "GoCgoPrepare",
         executable = go.toolchain._builder,
         arguments = [prepare_args],
@@ -413,7 +447,7 @@ def _run_cgo_prepare(
         toolchain = GO_TOOLCHAIN_LABEL,
         execution_requirements = execution_requirements,
     )
-    return objects
+    return struct(objects = objects, go_manifest = go_manifest, compile_inputs = compile_inputs)
 
 def _run_nogo(
         go,
@@ -437,6 +471,7 @@ def _run_nogo(
     outputs = [out_diagnostics, out_facts]
 
     nogo_args = go.tool_args(go)
+    nogo_args.add_all(sources, before_each = "-src")
     if cgo_go_srcs:
         inputs_direct.append(cgo_go_srcs)
         nogo_args.add_all([cgo_go_srcs], before_each = "-ignore_src")

@@ -17,6 +17,8 @@ Every execution also checks exact ``runtime.Caller`` source paths and lines for
 ordinary Go, nested cgo Go, and an authored relative ``//line`` directive, so
 projection or temporary paths cannot silently replace source locations. The C++
 function uses the C++ standard library, checking that its link flags are retained.
+An ordinary Go file embeds a data file from a subdirectory; every run checks its
+contents to preserve embed lookup through the split compilation path.
 
 Each ``edit-loop`` JSON row in ``test.log`` names its variant and contains fixture
 actions grouped by target and mnemonic, separate execution and disk/remote-cache
@@ -37,6 +39,8 @@ stages appear automatically in the action counts. The split variant records
 ``GoCgoProject``, ``GoCgoGenerate``, one ``GoCgoCompile`` per original native source,
 and ``GoCgoPrepare``. Generation still groups cgo and compilation of generated C
 code; preparation performs the native link probe and dynamic-import generation.
+``GoCompilePkg`` produces the Go-only and export archives, while ``GoPack``
+combines the Go-only archive and native members into the compatibility archive.
 Raw execution logs are temporary; compact rows remain in test.log.
 
 The regression gates check that the edited program behaves correctly, its
@@ -57,13 +61,18 @@ generation and native compilation. Ordinary Go and Go dependency edits also skip
 generation and native compilation.
 
 Split packages also expose a Go archive without the cgo native objects. C, C++,
-and native dependency body edits in this fixture must preserve its bytes;
-ordinary Go and cgo Go body edits must change them. These checks establish a
-cache boundary for a future Go prelink action. The conventional archive and
-final executable still change after effective native edits. Dynamic-import
-metadata remains in the Go archive: native edits that change that metadata may
-also invalidate it. Go compilation and final linking are not skipped by this
-artifact separation alone.
+and native dependency body edits in this fixture must preserve its bytes and
+the export archive, and skip every fixture Go compilation without a spawn or
+disk/remote-cache lookup. Direct C/C++ edits refresh ``GoPack`` and change the
+compatibility archive; a separately linked native dependency body edit must
+skip packing and preserve that archive. Ordinary Go and cgo Go body edits
+refresh compilation and packing and change the Go-only archive. The clean-build
+actions also prove the compiler excludes native source/object inputs and that
+the pack action consumes the Go-only archive and native objects. These checks
+inspect artifact dependencies rather than relying on execution-log ordering.
+Dynamic-import metadata remains in the Go archive: native edits that change
+that metadata may still invalidate compilation. The final executable changes
+after every effective edit.
 
 A separate retention fixture calls both Go assembly and code from a ``.syso``
 file. With no cgo native members, its full archive and Go-only archive must be

@@ -18,6 +18,7 @@ import (
 	"go/build"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 var ASM_DEFINES = []string{
@@ -29,7 +30,7 @@ var ASM_DEFINES = []string{
 // buildSymabisFile generates a file from assembly files that is consumed by
 // the compiler. If there are no assembly files, no file will be generated,
 // and "", nil will be returned.
-func buildSymabisFile(goenv *env, packagePath string, sFiles, hFiles []fileInfo, asmhdr string) (string, error) {
+func buildSymabisFile(goenv *env, packagePath string, sFiles, hFiles []fileInfo, asmhdr string, pathRewrites []string) (string, error) {
 	if len(sFiles) == 0 {
 		return "", nil
 	}
@@ -60,8 +61,12 @@ func buildSymabisFile(goenv *env, packagePath string, sFiles, hFiles []fileInfo,
 		return symabisName, err
 	}
 	asmargs := goenv.goTool("asm")
-	asmargs = append(asmargs, "-trimpath", wd)
-	asmargs = append(asmargs, "-I", wd)
+	asmargs = append(asmargs, "-trimpath", strings.Join(append(append([]string{}, pathRewrites...), wd), ";"))
+	includeRoot := wd
+	if len(pathRewrites) != 0 {
+		includeRoot = strings.SplitN(pathRewrites[0], "=>", 2)[0]
+	}
+	asmargs = append(asmargs, "-I", includeRoot)
 	asmargs = append(asmargs, "-I", filepath.Join(os.Getenv("GOROOT"), "pkg", "include"))
 	asmargs = append(asmargs, "-I", asmhdrDir)
 	seenHdrDirs := map[string]bool{wd: true, asmhdrDir: true}
@@ -83,20 +88,31 @@ func buildSymabisFile(goenv *env, packagePath string, sFiles, hFiles []fileInfo,
 		asmargs = append(asmargs, sFile.filename)
 	}
 
-	err = goenv.runCommand(asmargs)
+	err = runAsmCommand(goenv, asmargs, pathRewrites)
 	return symabisName, err
 }
 
-func asmFile(goenv *env, srcPath, packagePath string, asmFlags []string, outPath string) error {
+func asmFile(goenv *env, srcPath, packagePath string, asmFlags []string, outPath string, pathRewrites []string) error {
 	args := goenv.goTool("asm")
 	args = append(args, asmFlags...)
 	if packagePath != "" {
 		args = append(args, "-p", packagePath)
 	}
 	args = append(args, ASM_DEFINES...)
-	args = append(args, "-trimpath", ".")
+	args = append(args, "-trimpath", strings.Join(append(append([]string{}, pathRewrites...), abs(".")), ";"))
 	args = append(args, "-o", outPath)
 	args = append(args, "--", srcPath)
-	absArgs(args, []string{"-I", "-o", "-trimpath"})
-	return goenv.runCommand(args)
+	absArgs(args, []string{"-I", "-o"})
+	return runAsmCommand(goenv, args, pathRewrites)
+}
+
+func runAsmCommand(goenv *env, args, pathRewrites []string) error {
+	if len(pathRewrites) == 0 {
+		return goenv.runCommand(args)
+	}
+	// The assembler opens quoted includes from cwd before the source's
+	// directory or -I paths. Preserve that precedence in the projection.
+	args[0] = abs(args[0])
+	absArgs(args, []string{"-I", "-o"})
+	return goenv.runCommandInDir(args, strings.SplitN(pathRewrites[0], "=>", 2)[0])
 }
