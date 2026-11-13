@@ -233,8 +233,6 @@ def emit_link(
     tool_args.add_joined("-extldflags", extldflags, join_with = " ")
 
     inputs_direct = stamp_inputs + [go.sdk.package_list]
-    if emit_buildinfo and buildinfo_module_metadata:
-        inputs_direct.append(buildinfo_module_metadata)
     if go.coverage_enabled and go.coverdata:
         inputs_direct.append(go.coverdata.data.file)
     inputs_transitive = [
@@ -245,13 +243,28 @@ def emit_link(
         go.cc_toolchain_files,
         go.sdk.tools,
         go.stdlib.libs,
-        buildinfo_link_inputs,
     ]
-    inputs = depset(direct = inputs_direct, transitive = inputs_transitive)
+    link_inputs = depset(direct = inputs_direct, transitive = inputs_transitive)
+    if emit_buildinfo and buildinfo_module_metadata:
+        buildinfo_link_inputs = depset([buildinfo_module_metadata], transitive = [buildinfo_link_inputs])
+    inputs = depset(transitive = [link_inputs, buildinfo_link_inputs])
+    outputs = [executable]
+    unused_inputs_list = None
+    if emit_buildinfo:
+        # reachableModules reads only metadata and imports manifests reachable
+        # from the main package. Keep archives, tools, and native inputs even if
+        # a custom metadata provider also points at one of those files.
+        unused_inputs_list = go.actions.declare_file(executable.basename + ".unused_buildinfo_inputs", sibling = executable)
+        outputs.append(unused_inputs_list)
+        builder_args.add("-unused_inputs_list", unused_inputs_list)
+        builder_args.add_all(buildinfo_link_inputs, before_each = "-buildinfo_input", expand_directories = False)
+        builder_args.add_all(link_inputs, before_each = "-link_input", expand_directories = False)
+        builder_args.add("-link_input", go.toolchain._builder)
 
     go.actions.run(
         inputs = inputs,
-        outputs = [executable],
+        outputs = outputs,
+        unused_inputs_list = unused_inputs_list,
         mnemonic = "GoLink",
         executable = go.toolchain._builder,
         arguments = [builder_args, "--", tool_args],
