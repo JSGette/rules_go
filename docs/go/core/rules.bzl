@@ -120,6 +120,12 @@ generation and the other native objects. Changing only a native dependency's
 implementation reuses compilation and reruns the cgo probe link. All stages
 use declared inputs and outputs suitable for remote caching.
 
+Split packages also emit a `.go.a` archive without the cgo native objects,
+alongside the conventional `.a` archive. Go assembly and `.syso` members stay
+in both. Private archive data carries this output and the ordered native object
+sidecar for future separate Go prelink and host-link actions. Current linking
+continues to consume the conventional archive.
+
 This is opt-in because the extra actions can cost more than they save for small
 packages or clean builds. Coverage-instrumented packages and packages with
 directory artifacts in `srcs` keep the combined action. Generated C wrappers

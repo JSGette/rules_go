@@ -21,7 +21,7 @@ function uses the C++ standard library, checking that its link flags are retaine
 Each ``edit-loop`` JSON row in ``test.log`` names its variant and contains fixture
 actions grouped by target and mnemonic, separate execution and disk/remote-cache
 counts, per-source native compile input/output identities, output SHA-256 digests
-(including package ``.a``, export ``.x``, generated cgo files, and native objects),
+(including package ``.a``, split ``.go.a``, export ``.x``, generated cgo files, and native objects),
 and elapsed build time. A persistent local action-cache hit produces no
 execution-log record. Elapsed time is informational, includes logging overhead, and is never
 asserted. The clean build may still hit a configured disk or remote cache; its
@@ -55,6 +55,20 @@ A cgo Go body edit refreshes generation but preserves the native compiles when
 their generated header is unchanged. A native dependency body edit skips both
 generation and native compilation. Ordinary Go and Go dependency edits also skip
 generation and native compilation.
+
+Split packages also expose a Go archive without the cgo native objects. C, C++,
+and native dependency body edits in this fixture must preserve its bytes;
+ordinary Go and cgo Go body edits must change them. These checks establish a
+cache boundary for a future Go prelink action. The conventional archive and
+final executable still change after effective native edits. Dynamic-import
+metadata remains in the Go archive: native edits that change that metadata may
+also invalidate it. Go compilation and final linking are not skipped by this
+artifact separation alone.
+
+A separate retention fixture calls both Go assembly and code from a ``.syso``
+file. With no cgo native members, its full archive and Go-only archive must be
+byte-identical. This guards against classifying every ``.o`` member as native
+or dropping system object members while introducing the new boundary.
 
 Final linking remains visible as repeated ``GoLink`` execution/cache counts;
 this optimization does not promise to skip final linking after effective code

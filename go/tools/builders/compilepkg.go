@@ -43,6 +43,7 @@ func compilePkg(args []string) error {
 	var deps archiveMultiFlag
 	var importPath, packagePath, packageListPath, coverMode string
 	var outLinkobjPath, outInterfacePath, outImportsPath, cgoExportHPath, cgoGoSrcsPath string
+	var outGoOnlyPath string
 	var testFilter string
 	var gcFlags, asmFlags, cppFlags, cFlags, cxxFlags, objcFlags, objcxxFlags, ldFlags quoteMultiFlag
 	var coverFormat string
@@ -70,6 +71,7 @@ func compilePkg(args []string) error {
 	fs.StringVar(&outLinkobjPath, "lo", "", "The full output archive file required by the linker")
 	fs.StringVar(&outInterfacePath, "o", "", "The export-only output archive required to compile dependent packages")
 	fs.StringVar(&outImportsPath, "imports", "", "Path to write the packagePaths actually imported by the filtered sources, one per line.")
+	fs.StringVar(&outGoOnlyPath, "go_only_archive", "", "Optional archive excluding cgo native objects, retaining Go assembly and .syso objects")
 	fs.StringVar(&cgoExportHPath, "cgoexport", "", "The _cgo_exports.h file to write")
 	fs.StringVar(&cgoGoSrcsPath, "cgo_go_srcs", "", "The directory to emit cgo-generated Go sources for nogo consumption to")
 	fs.StringVar(&cgoPreparedGo, "cgo_prepared_go", "", "Directory of Go sources from a separate cgo action")
@@ -96,6 +98,12 @@ func compilePkg(args []string) error {
 	cgoEnabled := os.Getenv("CGO_ENABLED") == "1"
 	cc := os.Getenv("CC")
 	outLinkobjPath = abs(outLinkobjPath)
+	if outGoOnlyPath != "" {
+		outGoOnlyPath = abs(outGoOnlyPath)
+		if outGoOnlyPath == outLinkobjPath || outGoOnlyPath == abs(outInterfacePath) {
+			return errors.New("-go_only_archive must differ from -lo and -o")
+		}
+	}
 	for i := range unfilteredSrcs {
 		unfilteredSrcs[i] = abs(unfilteredSrcs[i])
 	}
@@ -143,6 +151,7 @@ func compilePkg(args []string) error {
 		outLinkobjPath,
 		outInterfacePath,
 		outImportsPath,
+		outGoOnlyPath,
 		cgoExportHPath,
 		cgoGoSrcsPath,
 		cgoPreparedGo,
@@ -178,6 +187,7 @@ func compileArchive(
 	outLinkObj string,
 	outInterfacePath string,
 	outImportsPath string,
+	outGoOnlyPath string,
 	cgoExportHPath string,
 	cgoGoSrcsForNogoPath string,
 	cgoPreparedGo string,
@@ -426,6 +436,10 @@ func compileArchive(
 		gcFlags = append(gcFlags, "-trimpath="+trimPath)
 	}
 
+	// Everything collected so far is a native cgo object. Go assembler and
+	// .syso objects added below must remain in both archive variants.
+	cgoObjectCount := len(objFiles)
+
 	importcfgPath, imports, err := checkImportsAndBuildCfg(goenv, importPath, srcs, deps, packageListPath, recompileInternalDeps, compilingWithCgo, coverMode, workDir)
 	if err != nil {
 		return err
@@ -522,6 +536,24 @@ func compileArchive(
 	// Windows resource files (.syso) are treated the same as object files.
 	for _, src := range srcs.sysoSrcs {
 		objFiles = append(objFiles, src.filename)
+	}
+
+	if outGoOnlyPath != "" {
+		// Preserve the compiler's archive before appending cgo objects. Copy it
+		// rather than parsing archive members: native and Go assembler objects
+		// both use .o names, and the original combined archive must retain its
+		// existing member order.
+		if err := os.Remove(outGoOnlyPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err := copyFile(outLinkObj, outGoOnlyPath); err != nil {
+			return err
+		}
+		if retainedObjects := objFiles[cgoObjectCount:]; len(retainedObjects) > 0 {
+			if err := appendToArchive(goenv, pack, outGoOnlyPath, retainedObjects); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Pack .o and .syso files into the archive. These may come from cgo generated code,

@@ -119,7 +119,7 @@ def emit_archive(go, source = None, _recompile_suffix = "", recompile_internal_d
         cgo_deps = cgo.deps
         cgo_link_inputs = cgo.link_inputs
         runfiles = runfiles.merge(cgo.runfiles)
-        emit_compilepkg(
+        compiled = emit_compilepkg(
             go,
             sources = source.srcs,
             cover = source.cover,
@@ -153,7 +153,7 @@ def emit_archive(go, source = None, _recompile_suffix = "", recompile_internal_d
     else:
         cgo_deps = depset()
         cgo_link_inputs = depset()
-        emit_compilepkg(
+        compiled = emit_compilepkg(
             go,
             sources = source.srcs,
             cover = source.cover,
@@ -176,6 +176,9 @@ def emit_archive(go, source = None, _recompile_suffix = "", recompile_internal_d
             is_external_pkg = is_external_pkg,
         )
 
+    # Custom implementations may keep the original no-return contract.
+    go_file = getattr(compiled, "go_file", None) if compiled != None else None
+    cgo_objects = getattr(compiled, "cgo_objects", None) if compiled != None else None
     data = GoArchiveData(
         # TODO(#2578): reconsider the provider API. There's a lot of redundant
         # information here. Some fields are tuples instead of lists or dicts
@@ -210,6 +213,10 @@ def emit_archive(go, source = None, _recompile_suffix = "", recompile_internal_d
 
         # Information needed by dependents
         file = out_lib,
+        # The Go archive keeps Go assembly and .syso members; only cgo native
+        # objects move to the sidecar. Keep file as the compatible full archive.
+        _go_file = go_file if go_file != None else out_lib,
+        _cgo_objects = cgo_objects,
         export_file = out_export,
         facts_file = out_facts,
         runfiles = source.runfiles,

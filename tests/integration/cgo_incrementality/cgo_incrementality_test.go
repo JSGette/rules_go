@@ -15,6 +15,7 @@
 package cgo_incrementality_test
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -24,6 +25,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -79,6 +81,39 @@ go_test(
     name = "native_only_test",
     srcs = ["native_only/ordinary_test.go", "native_only/unused.c"],
     cgo = True,
+)
+
+# Match tests/core/go_library's .syso fixture: cc_library selects the native
+# toolchain, and the genrule only changes the archive's extension.
+cc_library(
+    name = "retained_native",
+    srcs = ["retained/native.c"],
+    linkstatic = True,
+)
+
+genrule(
+    name = "retained_syso",
+    srcs = [":retained_native"],
+    outs = ["retained/imported.syso"],
+    cmd = "cp $< $@",
+)
+
+go_library(
+    name = "retained",
+    srcs = [
+        "retained/retained.go",
+        "retained/retained_amd64.s",
+        "retained/retained_arm64.s",
+        ":retained_syso",
+    ],
+    cgo = True,
+    importpath = "example.com/incremental/retained",
+)
+
+go_test(
+    name = "retained_test",
+    srcs = ["retained/retained_test.go"],
+    deps = [":retained"],
 )
 -- ordinary.go --
 package lib
@@ -183,6 +218,50 @@ func TestOrdinaryGoIsRetained(t *testing.T) {
 }
 -- native_only/unused.c --
 int unused(void) { return 42; }
+-- retained/native.c --
+int retained_native(void) { return 2; }
+-- retained/retained.go --
+package retained
+
+func assemblyValue() int32
+func nativeValue() int32
+func Value() int32 { return assemblyValue() + nativeValue() }
+-- retained/retained_amd64.s --
+#include "textflag.h"
+
+TEXT ·assemblyValue(SB), NOSPLIT, $0-4
+    MOVL $40, ret+0(FP)
+    RET
+
+TEXT ·nativeValue(SB), NOSPLIT, $0-4
+    CALL retained_native(SB)
+    MOVL AX, ret+0(FP)
+    RET
+-- retained/retained_arm64.s --
+#include "textflag.h"
+
+TEXT ·assemblyValue(SB), NOSPLIT, $0-4
+    MOVW $40, R0
+    MOVW R0, ret+0(FP)
+    RET
+
+TEXT ·nativeValue(SB), NOSPLIT, $0-4
+    BL retained_native(SB)
+    MOVW R0, ret+0(FP)
+    RET
+-- retained/retained_test.go --
+package retained_test
+
+import (
+    "testing"
+    "example.com/incremental/retained"
+)
+
+func TestRetainedObjects(t *testing.T) {
+    if got := retained.Value(); got != 42 {
+        t.Fatalf("Go assembly plus .syso result = %d, want 42", got)
+    }
+}
 `})
 }
 
@@ -255,6 +334,33 @@ func TestNativeOnly(t *testing.T) {
 	}
 }
 
+func TestGoAssemblyAndSysoRetained(t *testing.T) {
+	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
+		t.Skip("fixture has Go assembly implementations for amd64 and arm64")
+	}
+	if err := bazel_testing.RunBazel("test", "//:retained_test", "--features=go_split_cgo", "--remote_download_outputs=all"); err != nil {
+		t.Fatal(err)
+	}
+	bin, err := bazel_testing.BazelOutput("info", "bazel-bin", "--features=go_split_cgo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := strings.TrimSpace(string(bin))
+	full, err := os.ReadFile(filepath.Join(binDir, "retained.a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	goOnly, err := os.ReadFile(filepath.Join(binDir, "retained_", "retained.go.a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No objects came from cgo here: Go assembly and .syso must remain in
+	// both archives, with the same member order and contents.
+	if !bytes.Equal(full, goOnly) {
+		t.Fatal("Go-only archive differs from full archive containing only Go, Go assembly, and .syso")
+	}
+}
+
 func runEditLoop(t *testing.T, variant string) {
 	// bazel_testing deliberately shares an output base across integration tests.
 	// Clean it so the baseline discovers every fixture output even on reruns.
@@ -272,6 +378,7 @@ func runEditLoop(t *testing.T, variant string) {
 	generatedArtifacts := make(map[string]bool)
 	nativeObjects := make(map[string]string) // original source -> declared object
 	var executable string
+	var goOnlyArchive string
 
 	build := func(step string, want int) observation {
 		t.Helper()
@@ -346,6 +453,9 @@ func runEditLoop(t *testing.T, variant string) {
 				row.Links = append(row.Links, linkObservation{label, s.Runner, s.CacheHit, s.Metrics})
 			}
 			for _, output := range s.ActualOutputs {
+				if label == "//:lib" && strings.HasSuffix(output.Path, ".go.a") {
+					goOnlyArchive = output.Path
+				}
 				if s.Mnemonic == "GoCgoPrepare" {
 					preparedArtifacts[output.Path] = true
 				}
@@ -401,6 +511,11 @@ func runEditLoop(t *testing.T, variant string) {
 		if len(generatedArtifacts) == 0 {
 			t.Fatal("baseline did not log generated cgo outputs")
 		}
+		if goOnlyArchive == "" {
+			t.Fatal("baseline did not log a Go-only archive")
+		}
+	} else if goOnlyArchive != "" {
+		t.Fatal("combined cgo action unexpectedly produced a Go-only archive")
 	}
 	for _, label := range []string{"//:lib", "//:consumer", "//:app", "//:go_dep"} {
 		for _, ext := range []string{".a", ".x"} {
@@ -452,6 +567,19 @@ func runEditLoop(t *testing.T, variant string) {
 		}
 		current := build(edit.step, 101+i)
 		if variant == "split" {
+			// This is the content boundary a future Go prelink action consumes.
+			// The final executable still uses the conventional combined archive.
+			goArchiveChanged := previous.SHA256[goOnlyArchive] != current.SHA256[goOnlyArchive]
+			switch edit.step {
+			case "c-body", "cxx-body", "cdep-body":
+				if goArchiveChanged {
+					t.Errorf("%s: native body edit changed the Go-only archive", edit.step)
+				}
+			case "ordinary-go-body", "cgo-go-body":
+				if !goArchiveChanged {
+					t.Errorf("%s: Go body edit did not change the Go-only archive", edit.step)
+				}
+			}
 			var wantNative []string
 			switch edit.step {
 			case "header", "cppopts":

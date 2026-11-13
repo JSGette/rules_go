@@ -79,8 +79,14 @@ def emit_compilepkg(
         gc_goopts = [],
         testfilter = None,  # TODO: remove when test action compiles packages
         recompile_internal_deps = [],
-        is_external_pkg = False):
-    """Compiles a complete Go package."""
+        is_external_pkg = False,
+        out_go_lib = None):
+    """Compiles a complete Go package and returns optional private split outputs.
+
+    out_go_lib may specify the Go archive for an eligible split-cgo action. When
+    omitted, that action declares it under the target's output directory. Other actions return out_lib
+    as go_file and None as cgo_objects. Existing callers may ignore the result.
+    """
     if sources == None:
         fail("sources is a required parameter")
     if out_lib == None:
@@ -109,12 +115,19 @@ def emit_compilepkg(
         not (cover and go.coverdata) and
         not any([src.is_directory for src in sources])
     )
+    if out_go_lib != None and not split_cgo:
+        fail("out_go_lib requires an eligible go_split_cgo action")
+    if split_cgo and out_go_lib == None:
+        stem = out_lib.basename[:-2] if out_lib.basename.endswith(".a") else out_lib.basename
+        out_go_lib = go.declare_file(go, path = stem + ".go.a")
 
     sdk = go.sdk
     inputs_direct = (sources + embedsrcs + [sdk.package_list, go.toolchain._pack] +
                      [archive.data.export_file for archive in archives])
     inputs_transitive = [sdk.headers, sdk.tools, go.stdlib.libs, headers]
     outputs = [out_lib, out_export, out_imports]
+    if out_go_lib != None:
+        outputs.append(out_go_lib)
 
     shared_args = go.builder_args(go)
     shared_args.add_all(sources, before_each = "-src")
@@ -185,6 +198,7 @@ def emit_compilepkg(
     # TODO: Remove the second condition after https://github.com/bazelbuild/bazel/pull/21921.
     env, execution_requirements = path_mapping_action_settings(go, cgo)
     cgo_go_srcs = None
+    cgo_objects = None
     if split_cgo:
         cgo_go_srcs = cgo_out_dir
         cgo_objects = _run_cgo_prepare(
@@ -208,6 +222,7 @@ def emit_compilepkg(
         inputs_direct.extend([cgo_go_srcs, cgo_objects])
         compile_args.add("-cgo_prepared_go", cgo_go_srcs.path)
         compile_args.add("-cgo_prepared_objects", cgo_objects.path)
+        compile_args.add("-go_only_archive", out_go_lib)
     elif cgo:
         if cgo_out_dir:
             cgo_go_srcs = cgo_out_dir
@@ -259,6 +274,11 @@ def emit_compilepkg(
             out_validation = out_nogo_validation,
             nogo = nogo,
         )
+
+    return struct(
+        go_file = out_go_lib if out_go_lib != None else out_lib,
+        cgo_objects = cgo_objects,
+    )
 
 def _run_cgo_prepare(
         go,
