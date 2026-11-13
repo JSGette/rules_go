@@ -3,6 +3,16 @@ load("//go/private:common.bzl", "RULES_GO_STDLIB_PREFIX")
 load("//go/private/rules:transition.bzl", "go_reset_target")
 
 go_test(
+    name = "cgopkg_test",
+    size = "small",
+    srcs = [
+        "cgopkg_test.go",
+        ":builder_srcs",
+    ],
+    x_defs = {"rulesGoStdlibPrefix": RULES_GO_STDLIB_PREFIX},
+)
+
+go_test(
     name = "filter_test",
     size = "small",
     srcs = [
@@ -135,6 +145,7 @@ filegroup(
         "buildinfo.go",
         "cc.go",
         "cgo2.go",
+        "cgopkg.go",
         "codesign.go",
         "compilepkg.go",
         "constants.go",

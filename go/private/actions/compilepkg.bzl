@@ -96,6 +96,19 @@ def emit_compilepkg(
     if cover and go.coverdata:
         archives = archives + [go.coverdata]
 
+    # Keep the combined action as the default: splitting trades extra action
+    # overhead for reuse of expensive native work after ordinary Go edits.
+    # Coverage rewrites the whole package before cgo, so it cannot use this
+    # boundary yet. Tree artifacts also need execution-time classification.
+    split_cgo = (
+        cgo and
+        cgo_out_dir != None and
+        "go_split_cgo" in go._ctx.features and
+        "go_split_cgo" not in go._ctx.disabled_features and
+        not (cover and go.coverdata) and
+        not any([src.is_directory for src in sources])
+    )
+
     sdk = go.sdk
     inputs_direct = (sources + embedsrcs + [sdk.package_list, go.toolchain._pack] +
                      [archive.data.export_file for archive in archives])
@@ -144,7 +157,7 @@ def emit_compilepkg(
     compile_args.add("-lo", out_lib)
     compile_args.add("-o", out_export)
     compile_args.add("-imports", out_imports)
-    if out_cgo_export_h:
+    if out_cgo_export_h and not split_cgo:
         compile_args.add("-cgoexport", out_cgo_export_h)
         outputs.append(out_cgo_export_h)
     if testfilter:
@@ -171,7 +184,30 @@ def emit_compilepkg(
     # TODO: Remove the second condition after https://github.com/bazelbuild/bazel/pull/21921.
     env, execution_requirements = path_mapping_action_settings(go, cgo)
     cgo_go_srcs = None
-    if cgo:
+    if split_cgo:
+        cgo_go_srcs = cgo_out_dir
+        cgo_objects = _run_cgo_prepare(
+            go,
+            sources = sources,
+            headers = headers,
+            cgo_inputs = cgo_inputs,
+            cgo_out_dir = cgo_out_dir,
+            out_lib = out_lib,
+            out_cgo_export_h = out_cgo_export_h,
+            importpath = importpath,
+            importmap = importmap,
+            testfilter = testfilter,
+            cppopts = cppopts,
+            copts = copts,
+            cxxopts = cxxopts,
+            objcopts = objcopts,
+            objcxxopts = objcxxopts,
+            ldflags = ldflags,
+        )
+        inputs_direct.extend([cgo_go_srcs, cgo_objects])
+        compile_args.add("-cgo_prepared_go", cgo_go_srcs.path)
+        compile_args.add("-cgo_prepared_objects", cgo_objects.path)
+    elif cgo:
         if cgo_out_dir:
             cgo_go_srcs = cgo_out_dir
             outputs.append(cgo_go_srcs)
@@ -195,7 +231,7 @@ def emit_compilepkg(
         inputs_direct.append(go.mode.pgoprofile)
 
     arguments = ["compilepkg", shared_args, compile_args]
-    if ldflags:
+    if ldflags and not split_cgo:
         arguments.append(ldflags)
 
     go.actions.run(
@@ -222,6 +258,89 @@ def emit_compilepkg(
             out_validation = out_nogo_validation,
             nogo = nogo,
         )
+
+def _run_cgo_prepare(
+        go,
+        *,
+        sources,
+        headers,
+        cgo_inputs,
+        cgo_out_dir,
+        out_lib,
+        out_cgo_export_h,
+        importpath,
+        importmap,
+        testfilter,
+        cppopts,
+        copts,
+        cxxopts,
+        objcopts,
+        objcxxopts,
+        ldflags):
+    """Produces cgo Go sources and native objects independently of Go bodies."""
+    sdk = go.sdk
+    go_sources = [src for src in sources if src.extension == "go"]
+    native_sources = [src for src in sources if src.extension not in ("go", "syso")]
+    projection = go.declare_directory(go, path = out_lib.basename + ".cgo_projection")
+    objects = go.declare_directory(go, path = out_lib.basename + ".cgo_objects")
+    env, execution_requirements = path_mapping_action_settings(go, True)
+
+    project_args = go.builder_args(go, "cgoproject")
+    project_args.add_all(go_sources, before_each = "-src")
+    project_args.add("-out", projection.path)
+    if testfilter:
+        project_args.add("-testfilter", testfilter)
+    go.actions.run(
+        inputs = depset(go_sources, transitive = [sdk.tools, sdk.headers, go.stdlib.libs]),
+        outputs = [projection],
+        mnemonic = "GoCgoProject",
+        executable = go.toolchain._builder,
+        arguments = [project_args],
+        env = env,
+        toolchain = GO_TOOLCHAIN_LABEL,
+        execution_requirements = execution_requirements,
+    )
+
+    prepare_args = go.builder_args(go, "cgoprepare")
+    prepare_args.add("-projection", projection.path)
+    prepare_args.add_all(native_sources, before_each = "-src")
+    prepare_args.add("-importpath", importpath or go.label.name)
+    if importmap:
+        prepare_args.add("-p", importmap)
+    prepare_args.add("-cgo_go_srcs", cgo_out_dir.path)
+    prepare_args.add("-cgo_objects", objects.path)
+    outputs = [cgo_out_dir, objects]
+    if out_cgo_export_h:
+        prepare_args.add("-cgoexport", out_cgo_export_h)
+        outputs.append(out_cgo_export_h)
+    for flag, opts in [
+        ("-cppflags", cppopts),
+        ("-cflags", copts),
+        ("-cxxflags", cxxopts),
+        ("-objcflags", objcopts),
+        ("-objcxxflags", objcxxopts),
+    ]:
+        if opts:
+            prepare_args.add(flag, quote_opts(opts))
+    arguments = [prepare_args]
+    if ldflags:
+        arguments.append(ldflags)
+    env = dict(env)
+    env["CC"] = go.cgo_tools.c_compiler_path
+    go.actions.run(
+        inputs = depset(
+            native_sources + [projection],
+            transitive = [sdk.tools, sdk.headers, go.stdlib.libs, headers, cgo_inputs, go.cc_toolchain_files],
+        ),
+        outputs = outputs,
+        mnemonic = "GoCgoPrepare",
+        executable = go.toolchain._builder,
+        arguments = arguments,
+        env = env,
+        toolchain = GO_TOOLCHAIN_LABEL,
+        execution_requirements = execution_requirements,
+    )
+    return objects
 
 def _run_nogo(
         go,

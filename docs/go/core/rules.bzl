@@ -108,6 +108,27 @@ Here is an example of a Bazel build graph for a project using these core rules:
 By instrumenting the lower level go tooling, we can cache smaller, finer
 artifacts with Bazel and thus, speed up incremental builds.
 
+### Experimental cgo action reuse
+
+Use `bazel build --features=go_split_cgo //path:target` to separate cgo and
+native compilation from Go compilation. A source projection action selects the
+Go files importing `C`. If an edit changes only ordinary Go code, the projection
+stays identical and Bazel reuses the generated cgo sources and native objects.
+The native action uses the configured C/C++ toolchain, headers, flags, and
+`cdeps`, with declared inputs and outputs suitable for remote caching.
+
+This is opt-in because the extra actions can cost more than they save for small
+packages or clean builds. Coverage-instrumented packages and packages with
+directory artifacts in `srcs` keep the combined action. An edit anywhere in a
+Go file importing `C` still invalidates native preparation, as do changes to
+native sources, headers, flags, and libraries. Final linking is unchanged.
+Disable the experiment with `--features=-go_split_cgo`.
+
+The [cgo edit-loop test](/tests/integration/cgo_incrementality/README.rst)
+records action reuse and output digests for both configurations. It also
+checks executable results; timings are diagnostic rather than performance
+thresholds.
+
 Rules
 -----
 

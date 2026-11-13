@@ -51,6 +51,10 @@ func main() {
 		action = baselineCoverage
 	case "compilepkg":
 		action = compilePkg
+	case "cgoproject":
+		action = cgoproject
+	case "cgoprepare":
+		action = cgoprepare
 	case "nogo":
 		action = nogo
 	case "nogovalidation":

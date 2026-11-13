@@ -1,0 +1,8 @@
+load("@io_bazel_rules_go//go/tools/bazel_testing:def.bzl", "go_bazel_test")
+
+go_bazel_test(
+    name = "cgo_incrementality_test",
+    size = "large",
+    srcs = ["cgo_incrementality_test.go"],
+    args = ["-test.v"],
+)

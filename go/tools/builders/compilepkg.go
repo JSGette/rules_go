@@ -47,6 +47,7 @@ func compilePkg(args []string) error {
 	var gcFlags, asmFlags, cppFlags, cFlags, cxxFlags, objcFlags, objcxxFlags, ldFlags quoteMultiFlag
 	var coverFormat string
 	var pgoprofile string
+	var cgoPreparedGo, cgoPreparedObjects string
 	fs.StringVar(&pack, "pack", "", "Path of the pack tool.")
 	fs.Var(&unfilteredSrcs, "src", ".go, .c, .cc, .m, .mm, .s, or .S file to be filtered and compiled")
 	fs.Var(&coverSrcs, "cover", ".go file that should be instrumented for coverage (must also be a -src)")
@@ -71,6 +72,8 @@ func compilePkg(args []string) error {
 	fs.StringVar(&outImportsPath, "imports", "", "Path to write the packagePaths actually imported by the filtered sources, one per line.")
 	fs.StringVar(&cgoExportHPath, "cgoexport", "", "The _cgo_exports.h file to write")
 	fs.StringVar(&cgoGoSrcsPath, "cgo_go_srcs", "", "The directory to emit cgo-generated Go sources for nogo consumption to")
+	fs.StringVar(&cgoPreparedGo, "cgo_prepared_go", "", "Directory of Go sources from a separate cgo action")
+	fs.StringVar(&cgoPreparedObjects, "cgo_prepared_objects", "", "Directory of native objects from a separate cgo action")
 	fs.StringVar(&testFilter, "testfilter", "off", "Controls test package filtering")
 	fs.StringVar(&coverFormat, "cover_format", "", "Emit source file paths in coverage instrumentation suitable for the specified coverage format")
 	fs.Var(&recompileInternalDeps, "recompile_internal_deps", "The import path of the direct dependencies that needs to be recompiled.")
@@ -80,6 +83,12 @@ func compilePkg(args []string) error {
 	}
 	if err := goenv.checkFlagsAndSetGoroot(); err != nil {
 		return err
+	}
+	if (cgoPreparedGo == "") != (cgoPreparedObjects == "") {
+		return errors.New("-cgo_prepared_go and -cgo_prepared_objects must be specified together")
+	}
+	if cgoPreparedGo != "" && coverMode != "" {
+		return errors.New("prepared cgo inputs cannot be used with coverage instrumentation")
 	}
 	if importPath == "" {
 		importPath = packagePath
@@ -136,6 +145,8 @@ func compilePkg(args []string) error {
 		outImportsPath,
 		cgoExportHPath,
 		cgoGoSrcsPath,
+		cgoPreparedGo,
+		cgoPreparedObjects,
 		coverFormat,
 		recompileInternalDeps,
 		pgoprofile)
@@ -169,6 +180,8 @@ func compileArchive(
 	outImportsPath string,
 	cgoExportHPath string,
 	cgoGoSrcsForNogoPath string,
+	cgoPreparedGo string,
+	cgoPreparedObjects string,
 	coverFormat string,
 	recompileInternalDeps []string,
 	pgoprofile string,
@@ -340,7 +353,32 @@ func compileArchive(
 	var objFiles []string
 	if compilingWithCgo {
 		var srcDir string
-		if coverMode != "" && cgoGoSrcsForNogoPath != "" {
+		if cgoPreparedGo != "" {
+			var generated []string
+			generated, objFiles, err = readCgoPrepared(cgoPreparedGo, cgoPreparedObjects)
+			if err != nil {
+				return err
+			}
+			// Match cgo2's source layout without modifying the prepared inputs.
+			// In particular, ordinary Go filenames must keep their existing
+			// trimpath behavior, including disambiguation of duplicate basenames.
+			srcDir = filepath.Join(workDir, "cgo", packagePath)
+			if err := os.MkdirAll(srcDir, 0700); err != nil {
+				return err
+			}
+			generatedBases, err := gatherSrcs(srcDir, generated)
+			if err != nil {
+				return err
+			}
+			goBases, err := gatherSrcs(srcDir, goSrcs)
+			if err != nil {
+				return err
+			}
+			goSrcs = nil
+			for _, base := range append(goBases, generatedBases...) {
+				goSrcs = append(goSrcs, filepath.Join(srcDir, base))
+			}
+		} else if coverMode != "" && cgoGoSrcsForNogoPath != "" {
 			// If the package uses Cgo, compile .s and .S files with cgo2, not the Go assembler.
 			// Otherwise: the .s/.S files will be compiled with the Go assembler later
 			srcDir, goSrcs, objFiles, err = cgo2(goenv, goSrcs, cgoSrcs, cSrcs, cxxSrcs, objcSrcs, objcxxSrcs, sSrcs, hSrcs, packagePath, packageName, cc, cppFlags, cFlags, cxxFlags, objcFlags, objcxxFlags, ldFlags, cgoExportHPath, "")
