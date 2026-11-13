@@ -1,0 +1,123 @@
+Incremental Go build work
+=========================
+
+This fork develops incremental build boundaries that Bazel can cache and send
+to remote executors. The default rules retain their existing behavior. The
+``go_split_cgo`` feature enables the current experiment with the configured
+C/C++ toolchain; it does not require a replacement Go compiler.
+
+Milestones and acceptance gates
+-------------------------------
+
+1. **Reproducibility and observations — implemented.** Preserve source paths
+   through coverage and cgo projection. Record action counts, artifact digests,
+   runtime results, and Bazel link-action durations for a fixed edit sequence.
+   Compare both combined and split builds; do not use timing thresholds as
+   correctness gates.
+
+2. **Independent native compilation — implemented.** Project files importing
+   ``C`` separately from ordinary Go files. Generate wrappers once, then compile
+   original native sources in individual actions. An ordinary Go edit reuses
+   native work; a C/C++ body edit recompiles only its own original object.
+   Header and language-specific option edits invalidate their consumers.
+
+3. **Go archive and native object separation — implemented in this branch.**
+   Emit ``.go.a`` without cgo native members and retain the conventional ``.a``.
+   Keep Go assembly and ``.syso`` members in both. Carry the Go archive and
+   ordered native sidecar through private archive data. The edit-loop gate
+   requires stable Go archive bytes after C/C++ and native dependency body
+   edits, and different bytes after Go body edits. Current linking still uses
+   the conventional archive, and Go compilation still runs after native edits.
+
+4. **Cache Go prelink independently — prototype, then Bazel integration.**
+   Separate ``GoPrelink`` from ``GoHostLink``. The first produces ``go.o`` and
+   a versioned host-link plan; the second consumes native sidecars, ``cdeps``,
+   and that plan. The prototype under ``experiments/go_prelink`` exercises
+   stock Go's external-link boundary and finalization. It is deliberately
+   pinned to one SDK and platform, and is not yet a Bazel action protocol.
+
+   Integration gates: select sidecars through actual import reachability,
+   including blank imports; omit declared-but-unimported packages; preserve
+   callbacks, constructors, library ordering, runtime metadata, FIPS
+   finalization, build IDs, debug information, and executable results. A native
+   body edit must run host linking with no Go prelink spawn/cache lookup.
+   A Go body edit must refresh both stages. Relocated execroots and remote
+   execution must work with no absolute paths in the persisted link plan.
+
+5. **Remove residual Go compilation after native edits — next.** Produce the
+   Go-only archive in ``GoCompilePkg`` and assemble the compatibility archive
+   in a small ``GoPack`` action. The compiler's inputs must omit native object
+   bytes and native source bodies. Preserve execution-time source selection,
+   Go assembly, nogo, and coverage fallback. Dynamic-import changes may still
+   invalidate Go compilation; an external-only path can later avoid the cgo
+   probe's dynamic-import dependency. Measure the extra action/copy cost on
+   clean builds before enabling this by default.
+
+6. **Reuse compiler backend work — separate compiler experiment if needed.**
+   First cache code generation per function or dependency group after normal
+   package parsing and type checking. Key entries on typed IR, compiler and
+   target configuration, ABI/layout facts, optimization inputs, and relevant
+   imported summaries. Retain full dependency invalidation for changes to
+   inlining, escape results, generic instantiations, and type layout. Compare
+   clean and incremental compiler output and runtime behavior before attempting
+   incremental type checking. Any new compiler repository starts private.
+
+7. **Reuse work across test binaries — a parallel track.** Build an explicit,
+   immutable dependency image identified by SDK/configuration and the exact
+   package closure. Consumers receive it through providers and declared inputs;
+   they cannot silently substitute a different ABI or dependency version.
+   Preserve separate test processes. Measure linker CPU, peak memory, output
+   bytes, cache transfers, and test behavior separately. Host-linker incremental
+   state can be an additional optimization where the configured toolchain
+   supports it; the initial host-link action can perform a complete native link.
+
+Small upstream candidates
+------------------------
+
+* ``codex/cgo-coverage-reproducibility`` fixes cgo/coverage source-path
+  reproducibility independently of the split-action feature.
+* ``codex/skip-unused-link-metadata`` omits build-info metadata inputs for modes
+  that do not embed it: C archives, C shared libraries, and plugins.
+* ``codex/prune-unused-link-metadata`` uses Bazel's ``unused_inputs_list`` for
+  executable metadata belonging to packages outside the actual import closure.
+  It retains shared metadata and real linker inputs, and tests import activation
+  after a previously unused metadata file changes.
+* The baseline edit-loop observations can be extracted from the experimental
+  fixture as a standalone performance/regression harness. The native-action and
+  prelink changes should remain opt-in until their platform and clean-build
+  costs have been measured.
+
+These branches are work in the fork, not submitted upstream changes.
+
+Existing discussions and what they imply for the design
+-------------------------------------------------------
+
+The open `Go issue 82274 <https://github.com/golang/go/issues/82274>`_ describes
+repeated linker work across large Bazel test closures and explicitly proposes
+incremental linking and shared dependency images. Its description distinguishes
+network transfer savings from linker CPU/memory savings. As checked on
+2026-11-13, it had no maintainer design decision beyond routing to the compiler
+team. It does not establish that either approach was rejected.
+
+`rules_go issue 4550 <https://github.com/bazel-contrib/rules_go/issues/4550>`_
+contains a shared-library proof of concept. The discussion identifies exact
+toolchain, package version, and export-data matching as requirements, and
+suggests a restricted provider interface instead of publishing general-purpose
+shared outputs. That is a useful basis for milestone 7.
+
+`Russ Cox's comment on Go issue 47788
+<https://github.com/golang/go/issues/47788#issuecomment-954890659>`_ describes
+problems with installation state in ``GOROOT``, shared-library cache behavior,
+and assumptions embedded in consumer code. It proposes explicit shared-image
+inputs and rejecting stale images. The proposal to remove shared mode was
+declined; its closed issue status must not be read as evidence that removal
+happened. Our design uses immutable declared artifacts and exact compatibility
+keys to address those concerns.
+
+For the cgo boundary, the `Go 1.26.7 cgo linking documentation
+<https://github.com/golang/go/blob/go1.26.7/src/cmd/cgo/doc.go>`_ describes static
+import/export directives and external linking. The `Go 1.26.7 FIPS linker code
+<https://github.com/golang/go/blob/go1.26.7/src/cmd/link/internal/ld/fips140.go>`_
+shows why external-link completion includes executable finalization. The
+prototype preserves that step rather than treating the CC invocation as the
+whole operation.
