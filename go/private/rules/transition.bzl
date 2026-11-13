@@ -16,6 +16,7 @@ load(
     "@bazel_skylib//lib:paths.bzl",
     "paths",
 )
+load("//go/private/tools:copy_cmd.bzl", "copy_cmd")
 load(
     "//go/private:mode.bzl",
     "LINKMODES",
@@ -42,6 +43,9 @@ TRANSITIONED_GO_SETTING_KEYS = [
     "//go/config:tags",
     "//go/config:pgoprofile",
 ]
+
+def _is_windows(ctx):
+    return ctx.configuration.host_path_separator == ";"
 
 def _deduped_and_sorted(strs):
     return sorted({s: None for s in strs}.keys())
@@ -306,11 +310,14 @@ def _go_reset_target_impl(ctx):
         # executable (important in the case of proto plugins), put it in a
         # subdirectory named after the label to prevent collisions.
         new_executable = ctx.actions.declare_file(paths.join(ctx.label.name, original_executable.basename))
-        ctx.actions.symlink(
-            output = new_executable,
-            target_file = original_executable,
-            is_executable = True,
-        )
+        if _is_windows(ctx):
+            copy_cmd(ctx, original_executable, new_executable)
+        else:
+            ctx.actions.symlink(
+                output = new_executable,
+                target_file = original_executable,
+                is_executable = True,
+            )
         default_runfiles = default_runfiles.merge(ctx.runfiles([new_executable]))
 
     providers.append(
@@ -503,3 +510,6 @@ _TAG_AFFECTS_STDLIB = {
     "timetzdata": None,
     "tools": None,  # Added in Go 1.21
 }
+
+# Loaded by the agent's go_library tags transition (@@//bazel/go_tags:transition.bzl).
+TAG_AFFECTS_STDLIB = _TAG_AFFECTS_STDLIB

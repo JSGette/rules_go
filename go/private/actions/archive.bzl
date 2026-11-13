@@ -84,7 +84,7 @@ def emit_archive(go, source = None, _recompile_suffix = "", recompile_internal_d
     files = []
     for a in direct:
         files.append(a.runfiles)
-        if a.source.mode != go.mode:
+        if not _mode_matches(a.source.mode, go.mode):
             fail("Archive mode does not match {} is {} expected {}".format(a.data.label, mode_string(a.source.mode), mode_string(go.mode)))
     runfiles = source.runfiles.merge_all(files)
 
@@ -262,3 +262,16 @@ def emit_archive(go, source = None, _recompile_suffix = "", recompile_internal_d
         _headers = headers,
         _buildinfo_link_inputs = buildinfo_link_inputs,
     )
+
+def _mode_matches(dep_mode, mode):
+    # A go_library whose closure reads none of its dependent's build tags is built without them,
+    # but keeps the ones mode adds itself, such as `race`.
+    if dep_mode == mode:
+        return True
+    for field in dir(mode):
+        value = getattr(mode, field)
+        if field == "tags" or type(value) == "builtin_function_or_method":
+            continue
+        if getattr(dep_mode, field, None) != value:
+            return False
+    return all([t in mode.tags for t in dep_mode.tags])

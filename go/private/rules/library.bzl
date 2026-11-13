@@ -39,6 +39,7 @@ load(
     "//go/private/rules:transition.bzl",
     "non_go_transition",
 )
+load("@@//bazel/go_tags:transition.bzl", "go_library_tags_transition")
 
 def _go_library_impl(ctx):
     """Implements the go_library() rule."""
@@ -80,6 +81,7 @@ def _go_library_impl(ctx):
 
 go_library = go_rule(
     _go_library_impl,
+    cfg = go_library_tags_transition,
     attrs = {
         "data": attr.label_list(
             allow_files = True,
