@@ -110,7 +110,8 @@ def emit_compilepkg(
     split_cgo = (
         cgo and
         cgo_out_dir != None and
-        "go_split_cgo" in go._ctx.features and
+        ("go_split_cgo" in go._ctx.features or
+         ("go_split_link" in go._ctx.features and "go_split_link" not in go._ctx.disabled_features)) and
         "go_split_cgo" not in go._ctx.disabled_features and
         not (cover and go.coverdata) and
         not any([src.is_directory for src in sources])

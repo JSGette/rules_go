@@ -43,6 +43,7 @@ func link(args []string) error {
 	importsFiles := multiFlag{}
 	buildInfoInputs := multiFlag{}
 	linkInputs := multiFlag{}
+	nativeObjects := multiFlag{}
 	archives := archiveMultiFlag{}
 	flags := flag.NewFlagSet("link", flag.ExitOnError)
 	goenv := envFlags(flags)
@@ -63,6 +64,8 @@ func link(args []string) error {
 	cover := flags.Bool("cover", false, "Whether coverage instrumentation is enabled.")
 	packagePath := flags.String("p", "", "Package path of the main archive.")
 	outFile := flags.String("o", "", "Path to output file.")
+	prelink := flags.String("prelink", "", "Output tree for the experimental external-link handoff.")
+	flags.Var(&nativeObjects, "native_objects", "Package import map and native object sidecar, separated by '=' (repeated).")
 	flags.Var(&archives, "arc", "Label, package path, and file name of a dependency, separated by '='")
 	flags.Var(&packageMetadataFiles, "package_metadata", "Package path and path of a package_metadata JSON file, separated by '=' (repeated).")
 	flags.Var(&importsFiles, "imports", "Package path and path of an imports manifest, separated by '=' (repeated).")
@@ -77,6 +80,24 @@ func link(args []string) error {
 	}
 	if err := goenv.checkFlagsAndSetGoroot(); err != nil {
 		return err
+	}
+	if *prelink != "" {
+		if err := checkPrelinkSDK(goenv); err != nil {
+			return err
+		}
+		if (*buildmode != "" && *buildmode != "exe") || *race || *msan || *cover {
+			return fmt.Errorf("split linking requires an ordinary executable without instrumentation")
+		}
+		if err := validatePrelinkToolArgs(toolArgs); err != nil {
+			return err
+		}
+		*prelink = abs(*prelink)
+		if err := os.MkdirAll(*prelink, 0777); err != nil {
+			return err
+		}
+		// cmd/link removes this path before invoking the external linker. The
+		// handoff never creates a binary or claims to have linked one.
+		*outFile = filepath.Join(*prelink, prelinkOutputName)
 	}
 	go123OrLater, err := onVersion(23)
 	if err != nil {
@@ -119,12 +140,21 @@ func link(args []string) error {
 	// Build an importcfg file.
 	modinfo := ""
 	var usedBuildInfoInputs []string
+	var selectedNativeObjects []string
+	if *prelink != "" {
+		var usedImports []string
+		selectedNativeObjects, usedImports, err = reachableNativeObjects(*packagePath, *mainImportsPath, importsFiles, nativeObjects)
+		if err != nil {
+			return err
+		}
+		usedBuildInfoInputs = append(usedBuildInfoInputs, usedImports...)
+	}
 	if shouldEmitBuildInfo(*buildmode) {
 		modules, usedInputs, err := reachableModules(*mainImportsPath, packageMetadataFiles, importsFiles)
 		if err != nil {
 			return err
 		}
-		usedBuildInfoInputs = usedInputs
+		usedBuildInfoInputs = append(usedBuildInfoInputs, usedInputs...)
 		mainModule := moduleInfo{}
 		if *mainModuleMetadata != "" {
 			mainModules, err := modulesFromPackageMetadataFiles([]string{*mainModuleMetadata})
@@ -216,6 +246,9 @@ func link(args []string) error {
 	defer linkerCleanup()
 	// add in the unprocess pass through options
 	goargs = append(goargs, toolArgs...)
+	if *prelink != "" {
+		goargs = append(goargs, "-linkmode=external", "-tmpdir", *prelink)
+	}
 	goargs = append(goargs, *main)
 
 	if go123OrLater {
@@ -226,13 +259,18 @@ func link(args []string) error {
 		os.Setenv("GOROOT", "GOROOT")
 		defer os.Setenv("GOROOT", oldroot)
 	}
-	if err := goenv.runCommand(goargs); err != nil {
-		return err
-	}
-
-	if contentBuildID {
-		if err := setContentBuildID(*outFile); err != nil {
-			return fmt.Errorf("error setting build ID: %v", err)
+	if *prelink != "" {
+		if err := runPrelink(goenv, goargs, *prelink, selectedNativeObjects, contentBuildID); err != nil {
+			return err
+		}
+	} else {
+		if err := goenv.runCommand(goargs); err != nil {
+			return err
+		}
+		if contentBuildID {
+			if err := setContentBuildID(*outFile); err != nil {
+				return fmt.Errorf("error setting build ID: %v", err)
+			}
 		}
 	}
 

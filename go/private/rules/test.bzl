@@ -757,6 +757,14 @@ def _recompile_external_deps(go, external_go_info, internal_archive, library_lab
                 data = arc_data,
                 direct = deps,
                 libs = depset(direct = [arc_data.file], transitive = [a.libs for a in deps]),
+                _go_libs = depset(
+                    direct = [getattr(arc_data, "_go_file", arc_data.file)],
+                    transitive = [getattr(a, "_go_libs", a.libs) for a in deps],
+                ),
+                _cgo_object_inputs = depset(
+                    direct = [arc_data._cgo_objects] if getattr(arc_data, "_cgo_objects", None) != None else [],
+                    transitive = [getattr(a, "_cgo_object_inputs", depset()) for a in deps],
+                ),
                 transitive = depset(direct = [arc_data], transitive = [a.transitive for a in deps]),
                 x_defs = go_info.x_defs,
                 cgo_deps = depset(transitive = [arc_data._cgo_deps] + [a.cgo_deps for a in deps]),

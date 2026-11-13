@@ -3,6 +3,17 @@ load("//go/private:common.bzl", "RULES_GO_STDLIB_PREFIX")
 load("//go/private/rules:transition.bzl", "go_reset_target")
 
 go_test(
+    name = "prelink_test",
+    size = "small",
+    srcs = [
+        "prelink_fips_test.go",
+        "prelink_test.go",
+        ":builder_srcs",
+    ],
+    x_defs = {"rulesGoStdlibPrefix": RULES_GO_STDLIB_PREFIX},
+)
+
+go_test(
     name = "cgopkg_test",
     size = "small",
     srcs = [
@@ -162,6 +173,8 @@ filegroup(
         "link.go",
         "nogo.go",
         "nogo_validation.go",
+        "prelink.go",
+        "prelink_fips.go",
         "preprofile.go",
         "read.go",
         "replicate.go",

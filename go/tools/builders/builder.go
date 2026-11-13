@@ -69,6 +69,8 @@ func main() {
 		action = genTestMain
 	case "link":
 		action = link
+	case "hostlink":
+		action = hostlink
 	case "gennogomain":
 		action = genNogoMain
 	case "preprofile":

@@ -123,8 +123,8 @@ use declared inputs and outputs suitable for remote caching.
 Split packages also emit a `.go.a` archive without the cgo native objects,
 alongside the conventional `.a` archive. Go assembly and `.syso` members stay
 in both. Private archive data carries this output and the ordered native object
-sidecar for future separate Go prelink and host-link actions. Current linking
-continues to consume the conventional archive.
+sidecar for the separate Go prelink and host-link experiment below. Without
+that experiment, linking continues to consume the conventional archive.
 
 This is opt-in because the extra actions can cost more than they save for small
 packages or clean builds. Coverage-instrumented packages and packages with
@@ -141,6 +141,34 @@ The [cgo edit-loop test](/tests/integration/cgo_incrementality/README.rst)
 records action reuse and output digests for both configurations. It also
 checks executable results; timings are diagnostic rather than performance
 thresholds.
+
+### Experimental Go/native linking
+
+Use `bazel build --features=go_split_link //path:target` to enable cgo action
+splitting plus separate `GoPrelink` and `GoHostLink` actions. Prelink consumes
+Go-only archives and produces a relocatable Go object and a host-link plan.
+Host linking consumes that plan, reachable packages' native objects, and the
+configured C/C++ toolchain's libraries. C/C++ and `cdeps` body edits that preserve
+Go archive bytes can reuse the entire prelink result. Go compilation may still
+run; separating archive packing from compilation is a subsequent optimization.
+
+The initial implementation supports normal executables with the Go 1.26.7 SDK
+on Linux amd64, with a Linux amd64 execution platform. Pure, static, race,
+sanitizer, coverage, shared/plugin, and other SDK/platform configurations use
+the ordinary link action. Packages that cannot split cgo retain their combined
+archive as a prelink input. Dynamic-import metadata changes can also invalidate
+prelink. This uses stock Go, including ELF FIPS finalization and content build
+IDs after the host link.
+
+Linker options that read extra files during capability probes, such as forwarded
+linker scripts, response files, explicit sysroots, or path-selected linkers, are
+rejected by this initial split-link path. Named `bfd`, `gold`, `lld`, and `mold`
+linker selections are supported; GCC/gold is covered by the current fixture.
+Use `--features=-go_split_link` for those configurations. The
+[split-link integration test](/tests/integration/cgo_prelink/README.rst) checks
+action reuse, callbacks, constructors, unused and blank imports, and replay of a
+cached prelink result in a different execution root. It does not claim a measured
+speedup or validation against a remote execution service.
 
 Rules
 -----

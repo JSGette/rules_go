@@ -26,23 +26,27 @@ Milestones and acceptance gates
    Keep Go assembly and ``.syso`` members in both. Carry the Go archive and
    ordered native sidecar through private archive data. The edit-loop gate
    requires stable Go archive bytes after C/C++ and native dependency body
-   edits, and different bytes after Go body edits. Current linking still uses
+   edits, and different bytes after Go body edits. Default linking still uses
    the conventional archive, and Go compilation still runs after native edits.
 
-4. **Cache Go prelink independently — prototype, then Bazel integration.**
-   Separate ``GoPrelink`` from ``GoHostLink``. The first produces ``go.o`` and
+4. **Cache Go prelink independently — opt-in implementation in this branch.**
+   ``--features=go_split_link`` separates ``GoPrelink`` from ``GoHostLink`` for
+   Go 1.26.7 Linux amd64 normal executables. The first produces ``go.o`` and
    a versioned host-link plan; the second consumes native sidecars, ``cdeps``,
-   and that plan. The prototype under ``experiments/go_prelink`` exercises
-   stock Go's external-link boundary and finalization. It is deliberately
-   pinned to one SDK and platform, and is not yet a Bazel action protocol.
+   and that plan. The standalone prototype under ``experiments/go_prelink``
+   remains as a small stock-Go demonstration. The Bazel implementation stores
+   path tokens in its plan so that replay can use a different execution root.
 
    Integration gates: select sidecars through actual import reachability,
    including blank imports; omit declared-but-unimported packages; preserve
    callbacks, constructors, library ordering, runtime metadata, FIPS
    finalization, build IDs, debug information, and executable results. A native
    body edit must run host linking with no Go prelink spawn/cache lookup.
-   A Go body edit must refresh both stages. Relocated execroots and remote
-   execution must work with no absolute paths in the persisted link plan.
+   A Go body edit must refresh both stages. The integration fixture requires a
+   prelink disk-cache hit and real host-link execution in a second output base
+   after a native edit. Remote execution service validation remains outstanding.
+   Forwarded file-reading linker options are rejected until capability probing
+   can model their additional dependencies correctly.
 
 5. **Remove residual Go compilation after native edits — next.** Produce the
    Go-only archive in ``GoCompilePkg`` and assemble the compatibility archive

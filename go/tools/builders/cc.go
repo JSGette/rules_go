@@ -19,7 +19,27 @@ func cc(args []string) error {
 	if ccroot == "" {
 		return errors.New("GO_CC_ROOT environment variable not set")
 	}
+	if tree := os.Getenv(prelinkCaptureEnv); tree != "" {
+		captured, err := capturePrelinkCC(tree, cc, args)
+		if err != nil {
+			return err
+		}
+		if captured {
+			os.Exit(prelinkHandoffExit)
+		}
+	}
+	normalized := ccCommandArgs(cc, ccroot, args)
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command(normalized[0], normalized[1:]...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	} else {
+		return syscall.Exec(normalized[0], normalized, os.Environ())
+	}
+}
 
+func ccCommandArgs(cc, ccroot string, args []string) []string {
 	normalized := []string{cc}
 	normalized = append(normalized, args...)
 	transformArgs(normalized, cgoAbsEnvFlags, func(s string) string {
@@ -37,12 +57,5 @@ func cc(args []string) error {
 		}
 		return s
 	})
-	if runtime.GOOS == "windows" {
-		cmd := exec.Command(normalized[0], normalized[1:]...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return cmd.Run()
-	} else {
-		return syscall.Exec(normalized[0], normalized, os.Environ())
-	}
+	return normalized
 }

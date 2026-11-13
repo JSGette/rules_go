@@ -28,6 +28,8 @@ GoArchiveData = provider()
 # See go/providers.rst#GoArchive for full documentation.
 GoArchive = provider(fields = [
     "_buildinfo_link_inputs",
+    "_cgo_object_inputs",
+    "_go_libs",
     "_headers",
     "cgo_deps",
     "cgo_exports",

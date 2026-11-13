@@ -245,6 +245,14 @@ def emit_archive(go, source = None, _recompile_suffix = "", recompile_internal_d
         data = data,
         direct = direct,
         libs = depset(direct = [out_lib], transitive = [a.libs for a in direct]),
+        _go_libs = depset(
+            direct = [data._go_file],
+            transitive = [getattr(a, "_go_libs", a.libs) for a in direct],
+        ),
+        _cgo_object_inputs = depset(
+            direct = [cgo_objects] if cgo_objects != None else [],
+            transitive = [getattr(a, "_cgo_object_inputs", depset()) for a in direct],
+        ),
         transitive = depset([data], transitive = [a.transitive for a in direct]),
         x_defs = x_defs,
         cgo_deps = depset(transitive = [cgo_deps] + [a.cgo_deps for a in direct]),

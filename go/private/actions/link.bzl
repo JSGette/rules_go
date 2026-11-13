@@ -40,6 +40,13 @@ load("//go/private:sdk.bzl", "parse_version")
 def _format_archive(d):
     return "{}={}={}".format(d.label, d.importmap, d.file.path)
 
+def _format_prelink_archive(d):
+    return "{}={}={}".format(d.label, d.importmap, getattr(d, "_go_file", d.file).path)
+
+def _format_native_objects(d):
+    objects = getattr(d, "_cgo_objects", None)
+    return "{}={}".format(d.importmap, objects.path) if objects != None else None
+
 def _format_package_metadata(d):
     if not d._package_metadata:
         return None
@@ -71,6 +78,20 @@ def emit_link(
         buildinfo_main_package_path = archive.data.importpath
     if buildinfo_module_metadata == None:
         buildinfo_module_metadata = getattr(archive.data, "_package_metadata", None)
+
+    # The captured external-link protocol and ELF finalization are pinned to
+    # this SDK/platform. Unsupported configurations retain ordinary GoLink.
+    split_link = (
+        "go_split_link" in go._ctx.features and
+        "go_split_link" not in go._ctx.disabled_features and
+        go.sdk.version == "1.26.7" and
+        go.sdk.goos == "linux" and go.sdk.goarch == "amd64" and
+        go.mode.goos == "linux" and go.mode.goarch == "amd64" and
+        go.mode.linkmode == LINKMODE_NORMAL and
+        not go.mode.pure and not go.mode.race and not go.mode.msan and
+        not go.coverage_enabled and not go.static_link
+    )
+    prelink = go.declare_directory(go, path = executable.basename + ".prelink") if split_link else None
 
     # Exclude -lstdc++ from link options. We don't want to link against it
     # unless we actually have some C++ code. _cgo_codegen will include it
@@ -115,7 +136,8 @@ def emit_link(
     else:
         extld = extld_from_cc_toolchain(go)
         tool_args.add_all(extld)
-        if extld and (go.static_link or
+        if extld and (split_link or
+                      go.static_link or
                       go.mode.race or
                       go.mode.linkmode != LINKMODE_NORMAL or
                       go.mode.goos == "windows" and go.mode.msan):
@@ -147,7 +169,14 @@ def emit_link(
         transitive = [d.transitive for d in archive.direct],
     )
 
-    builder_args.add_all(arcs, before_each = "-arc", map_each = _format_archive)
+    builder_args.add_all(arcs, before_each = "-arc", map_each = _format_prelink_archive if split_link else _format_archive)
+    all_archive_data = depset(test_archives, transitive = [archive.transitive])
+    if split_link:
+        builder_args.add("-prelink", prelink.path)
+
+        # These paths describe sidecars but are deliberately not prelink input
+        # files. Reachability chooses which ones the host-link plan consumes.
+        builder_args.add_all(all_archive_data, before_each = "-native_objects", map_each = _format_native_objects)
 
     # Keep this in sync with shouldEmitBuildInfo in builders/buildinfo.go.
     # These build modes do not embed module metadata. Declaring it as a link
@@ -155,7 +184,6 @@ def emit_link(
     emit_buildinfo = go.mode.linkmode not in (LINKMODE_C_ARCHIVE, LINKMODE_C_SHARED, LINKMODE_PLUGIN)
     buildinfo_link_inputs = depset()
     if emit_buildinfo:
-        all_archive_data = depset(test_archives, transitive = [archive.transitive])
         buildinfo_link_inputs = depset(
             direct = [
                 metadata
@@ -214,7 +242,7 @@ def emit_link(
         builder_args.add_all(stamp_inputs, before_each = "-stamp")
 
     builder_args.add("-o", executable)
-    builder_args.add("-main", archive.data.file)
+    builder_args.add("-main", getattr(archive.data, "_go_file", archive.data.file) if split_link else archive.data.file)
     if emit_buildinfo:
         builder_args.add("-main_package_path", buildinfo_main_package_path)
         builder_args.add("-main_imports", archive.data._imports)
@@ -236,19 +264,27 @@ def emit_link(
     if go.coverage_enabled and go.coverdata:
         inputs_direct.append(go.coverdata.data.file)
     inputs_transitive = [
-        archive.libs,
-        archive.cgo_deps,
-        archive.cgo_link_inputs,
-        go.stdlib.cgo_link_inputs,
         go.cc_toolchain_files,
         go.sdk.tools,
         go.stdlib.libs,
     ]
+    if split_link:
+        inputs_transitive.append(depset(
+            direct = [getattr(d, "_go_file", d.file) for d in test_archives],
+            transitive = [getattr(archive, "_go_libs", archive.libs)],
+        ))
+    else:
+        inputs_transitive.extend([
+            archive.libs,
+            archive.cgo_deps,
+            archive.cgo_link_inputs,
+            go.stdlib.cgo_link_inputs,
+        ])
     link_inputs = depset(direct = inputs_direct, transitive = inputs_transitive)
     if emit_buildinfo and buildinfo_module_metadata:
         buildinfo_link_inputs = depset([buildinfo_module_metadata], transitive = [buildinfo_link_inputs])
     inputs = depset(transitive = [link_inputs, buildinfo_link_inputs])
-    outputs = [executable]
+    outputs = [prelink] if split_link else [executable]
     unused_inputs_list = None
     if emit_buildinfo:
         # reachableModules reads only metadata and imports manifests reachable
@@ -265,13 +301,42 @@ def emit_link(
         inputs = inputs,
         outputs = outputs,
         unused_inputs_list = unused_inputs_list,
-        mnemonic = "GoLink",
+        mnemonic = "GoPrelink" if split_link else "GoLink",
         executable = go.toolchain._builder,
         arguments = [builder_args, "--", tool_args],
         env = go.env,
         toolchain = GO_TOOLCHAIN_LABEL,
         exec_group = exec_group,
     )
+
+    if split_link:
+        host_args = go.builder_args(go, "hostlink")
+        host_args.add("-prelink", prelink.path)
+        host_args.add("-o", executable)
+        go.actions.run(
+            inputs = depset(
+                direct = [prelink] + [
+                    d._cgo_objects
+                    for d in test_archives
+                    if getattr(d, "_cgo_objects", None) != None
+                ],
+                transitive = [
+                    getattr(archive, "_cgo_object_inputs", depset()),
+                    archive.cgo_deps,
+                    archive.cgo_link_inputs,
+                    go.stdlib.cgo_link_inputs,
+                    go.cc_toolchain_files,
+                    go.sdk.tools,
+                ],
+            ),
+            outputs = [executable],
+            mnemonic = "GoHostLink",
+            executable = go.toolchain._builder,
+            arguments = [host_args],
+            env = go.env,
+            toolchain = GO_TOOLCHAIN_LABEL,
+            exec_group = exec_group,
+        )
 
 def _extract_extldflags(gc_linkopts, extldflags):
     """Extracts -extldflags from gc_linkopts and combines them into a single list.
