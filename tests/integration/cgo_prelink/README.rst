@@ -2,7 +2,7 @@ Go prelink reuse
 ===============
 
 Run ``bazel test //tests/integration/cgo_prelink:cgo_prelink_test
---test_output=all`` on native Linux/amd64 with stock Go 1.26.7. Other hosts and
+--test_output=all`` on native Linux/amd64 with stock Go 1.26.7 or 1.26.10. Other hosts and
 SDK versions skip this experimental fixture. The fixture exercises the
 ``go_split_cgo`` and ``go_split_link`` features.
 

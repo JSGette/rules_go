@@ -86,11 +86,11 @@ def emit_link(
         buildinfo_module_metadata = getattr(archive.data, "_package_metadata", None)
 
     # The captured external-link protocol and ELF finalization are pinned to
-    # this SDK/platform. Unsupported configurations retain ordinary GoLink.
+    # these SDKs/platform. Unsupported configurations retain ordinary GoLink.
     split_link = (
         "go_split_link" in go._ctx.features and
         "go_split_link" not in go._ctx.disabled_features and
-        go.sdk.version == "1.26.7" and
+        go.sdk.version in ["1.26.7", "1.26.10"] and
         go.sdk.goos == "linux" and go.sdk.goarch == "amd64" and
         go.mode.goos == "linux" and go.mode.goarch == "amd64" and
         go.mode.linkmode == LINKMODE_NORMAL and

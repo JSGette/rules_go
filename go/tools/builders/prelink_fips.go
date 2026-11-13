@@ -21,8 +21,9 @@ const (
 )
 
 // finalizePrelinkELF performs the post-host-link FIPS checksum step from
-// Go 1.26.7's cmd/link/internal/ld/fips140.go (newFipsObj, addSection, elffips).
-// The caller must enforce that SDK version and the Linux amd64 target, and run
+// Go 1.26.7's cmd/link/internal/ld/fips140.go (newFipsObj, addSection, elffips),
+// which is unchanged in Go 1.26.10. The caller must enforce a supported SDK
+// version and the Linux amd64 target, and run
 // build-ID finalization afterward. This private format is not a stable Go API.
 // Executables without FIPS metadata need no checksum, as with stock cmd/link.
 func finalizePrelinkELF(path string) (err error) {

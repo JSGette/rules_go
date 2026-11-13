@@ -213,8 +213,8 @@ func requireSupportedHost(t *testing.T) {
 	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
 		t.Skip("experimental prelink fixture requires native Linux/amd64")
 	}
-	if runtime.Version() != "go1.26.7" {
-		t.Skip("experimental prelink fixture requires stock Go 1.26.7")
+	if runtime.Version() != "go1.26.7" && runtime.Version() != "go1.26.10" {
+		t.Skip("experimental prelink fixture requires stock Go 1.26.7 or 1.26.10")
 	}
 }
 

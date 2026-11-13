@@ -153,13 +153,17 @@ configured C/C++ toolchain's libraries. C/C++ and `cdeps` body edits that preser
 Go archive bytes can reuse the entire prelink result. Go compilation may still
 run; separating archive packing from compilation is a subsequent optimization.
 
-The initial implementation supports normal executables with the Go 1.26.7 SDK
+The initial implementation supports normal executables with the Go 1.26.7 or 1.26.10 SDK
 on Linux amd64, with a Linux amd64 execution platform. Pure, static, race,
 sanitizer, coverage, shared/plugin, and other SDK/platform configurations use
 the ordinary link action. Packages that cannot split cgo retain their combined
 archive as a prelink input. Dynamic-import metadata changes can also invalidate
 prelink. This uses stock Go, including ELF FIPS finalization and content build
 IDs after the host link.
+
+The builder, linker, and recorded host-link plan must use the same exact SDK
+version. Unlisted versions remain disabled until their external-link protocol
+and finalization have been checked.
 
 Linker options that read extra files during capability probes, such as forwarded
 linker scripts, response files, explicit sysroots, or path-selected linkers, are
